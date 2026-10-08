@@ -1,19 +1,40 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Optional release signing. Provide a gitignored `signing.properties` at the repo root with
+// storeFile, storePassword, keyAlias, keyPassword -- or the same values as CARLINK_STORE_FILE,
+// CARLINK_STORE_PASSWORD, CARLINK_KEY_ALIAS, CARLINK_KEY_PASSWORD environment variables (CI).
+val signingProps =
+    Properties().apply {
+        val f = rootProject.file("signing.properties")
+        if (f.exists()) f.inputStream().use { load(it) }
+    }
+
+fun signingValue(
+    prop: String,
+    env: String,
+): String? = signingProps.getProperty(prop) ?: System.getenv(env)
+
+val releaseStoreFile = signingValue("storeFile", "CARLINK_STORE_FILE")
+
 android {
     namespace = "com.carlink"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.werksmangm.cpaaplayer"
+        // Override with -Pcarlink.applicationId=... or in ~/.gradle/gradle.properties.
+        // NOTE: Android stores the USB "always open with" default per package name, so changing
+        // this after installing in the car means one more one-time permission prompt.
+        applicationId = providers.gradleProperty("carlink.applicationId").getOrElse("com.mbreeden.carlink")
         minSdk = 32
         targetSdk = 36
-        versionCode = 61
-        versionName = "1.1"
+        versionCode = 62
+        versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -22,8 +43,22 @@ android {
         }
     }
 
+    signingConfigs {
+        if (releaseStoreFile != null) {
+            create("release") {
+                storeFile = file(releaseStoreFile)
+                storePassword = signingValue("storePassword", "CARLINK_STORE_PASSWORD")
+                keyAlias = signingValue("keyAlias", "CARLINK_KEY_ALIAS")
+                keyPassword = signingValue("keyPassword", "CARLINK_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (releaseStoreFile != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -50,6 +85,11 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+
+    testOptions {
+        // android.util.Log etc. return defaults in plain JVM unit tests
+        unitTests.isReturnDefaultValues = true
     }
 
     lint {
@@ -88,6 +128,9 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    // Real org.json for JVM unit tests (the android.jar one is a stub)
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.3.0")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.7.0")
     androidTestImplementation(platform("androidx.compose:compose-bom:2025.12.01"))

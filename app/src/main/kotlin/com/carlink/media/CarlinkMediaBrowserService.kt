@@ -5,12 +5,17 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Bundle
 import android.support.v4.media.MediaBrowserCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import androidx.media.MediaBrowserServiceCompat
 import com.carlink.BuildConfig
 import com.carlink.MainActivity
@@ -71,10 +76,16 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
          * Called from CarlinkManager when entering STREAMING state.
          */
         fun startConnectionForeground(context: Context) {
-            // Start the service if not running
+            // Start the service if not running. Also re-sent when the activity returns to the
+            // foreground so a service that had to start without microphone eligibility can upgrade.
             val intent = Intent(context, CarlinkMediaBrowserService::class.java)
             intent.action = "ACTION_START_FOREGROUND"
-            context.startForegroundService(intent)
+            try {
+                context.startForegroundService(intent)
+            } catch (e: Exception) {
+                // Background-start restrictions: never crash the connection over a notification
+                Log.w(TAG, "[BROWSER_SERVICE] startForegroundService refused: ${e.message}")
+            }
         }
 
         /**
@@ -88,6 +99,7 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
     }
 
     private var isForeground = false
+    private var micTypeActive = false
 
     override fun onCreate() {
         super.onCreate()
@@ -252,17 +264,52 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
      * Called when adapter connects and streaming starts.
      */
     private fun startForegroundMode() {
-        if (isForeground) return
+        // Already foreground with the microphone type? Nothing to upgrade.
+        if (isForeground && micTypeActive) return
 
-        try {
-            val notification = buildNotification()
-            startForeground(NOTIFICATION_ID, notification)
-            isForeground = true
-            if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Entered foreground mode")
-        } catch (e: Exception) {
-            Log.e(TAG, "[BROWSER_SERVICE] Failed to start foreground: ${e.message}")
+        val notification = buildNotification()
+        val media = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+        val device = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+        val mic = ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        val micAllowed =
+            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+        // The microphone type is only legal while the app is visible (Android 14 "while-in-use" rule)
+        // and throws otherwise; connectedDevice throws if its prerequisite permission is missing.
+        // Try the richest combination first so mic capture is never silenced for background
+        // eligibility, then degrade so the service always ends up foreground in some form.
+        val candidates =
+            buildList {
+                if (micAllowed) {
+                    add((media or device or mic) to true)
+                    add((media or mic) to true)
+                }
+                add((media or device) to false)
+                add(media to false)
+            }
+        for ((type, hasMic) in candidates) {
+            // Never downgrade an already-foreground service just because the mic upgrade failed
+            if (isForeground && !hasMic) return
+            if (tryStartForeground(notification, type)) {
+                micTypeActive = hasMic
+                return
+            }
         }
     }
+
+    private fun tryStartForeground(
+        notification: Notification,
+        type: Int,
+    ): Boolean =
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+            isForeground = true
+            if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Entered foreground mode (types=$type)")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "[BROWSER_SERVICE] startForeground(types=$type) refused: ${e.message}")
+            false
+        }
 
     /**
      * Exit foreground mode.
@@ -274,6 +321,7 @@ class CarlinkMediaBrowserService : MediaBrowserServiceCompat() {
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
             isForeground = false
+            micTypeActive = false
             if (BuildConfig.DEBUG) Log.d(TAG, "[BROWSER_SERVICE] Exited foreground mode")
         } catch (e: Exception) {
             Log.e(TAG, "[BROWSER_SERVICE] Failed to stop foreground: ${e.message}")

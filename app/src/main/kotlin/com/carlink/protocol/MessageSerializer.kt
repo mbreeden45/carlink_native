@@ -318,7 +318,9 @@ oemIconLabel = ${config.boxName}
 
         when (initMode) {
             "MINIMAL_ONLY" -> {
-                // Just minimal - adapter retains all other settings
+                // Just minimal - adapter retains all other settings, EXCEPT the two that decide
+                // whether audio/mic reach this app at all (see addRoutingAssertions).
+                addRoutingAssertions(messages, config, emptySet())
                 // WiFi Enable sent last to activate wireless mode after config
                 messages.add(serializeCommand(CommandMapping.WIFI_ENABLE))
                 return messages
@@ -327,6 +329,7 @@ oemIconLabel = ${config.boxName}
             "MINIMAL_PLUS_CHANGES" -> {
                 // Add only the changed settings
                 addChangedSettings(messages, config, pendingChanges)
+                addRoutingAssertions(messages, config, pendingChanges)
                 // WiFi Enable sent last to activate wireless mode after config
                 messages.add(serializeCommand(CommandMapping.WIFI_ENABLE))
                 return messages
@@ -339,6 +342,33 @@ oemIconLabel = ${config.boxName}
                 messages.add(serializeCommand(CommandMapping.WIFI_ENABLE))
                 return messages
             }
+        }
+    }
+
+    /**
+     * Re-assert microphone source and audio transfer mode on every session.
+     *
+     * The adapter persists these across power cycles, so after the first full init they were never
+     * sent again. If the adapter ever drifts (firmware reset, another app, an old "box mic" or
+     * "bluetooth audio" setting), the symptoms are exactly "mic records silence" and "audio plays
+     * through the car's Bluetooth instead of CarPlay", with no way to recover short of a full reset.
+     * Two small commands per connect make the host's choice authoritative. Keys already being sent
+     * as pending changes are skipped to avoid duplicates.
+     */
+    private fun addRoutingAssertions(
+        messages: MutableList<ByteArray>,
+        config: AdapterConfig,
+        pendingChanges: Set<String>,
+    ) {
+        if (ConfigKey.MIC_SOURCE !in pendingChanges) {
+            messages.add(serializeCommand(if (config.micType == "box") CommandMapping.BOX_MIC else CommandMapping.MIC))
+        }
+        if (ConfigKey.AUDIO_SOURCE !in pendingChanges) {
+            messages.add(
+                serializeCommand(
+                    if (config.audioTransferMode) CommandMapping.AUDIO_TRANSFER_ON else CommandMapping.AUDIO_TRANSFER_OFF,
+                ),
+            )
         }
     }
 

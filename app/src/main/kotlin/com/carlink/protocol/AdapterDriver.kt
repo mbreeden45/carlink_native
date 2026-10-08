@@ -32,6 +32,9 @@ class AdapterDriver(
 
     private val isRunning = AtomicBoolean(false)
 
+    /** True between a successful [start] and [stop]. */
+    val running: Boolean get() = isRunning.get()
+
     // Performance tracking
     private var messagesSent = 0
     private var messagesReceived = 0
