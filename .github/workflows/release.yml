@@ -1,10 +1,12 @@
 name: Release bundle
 
-# Builds a signed AAB for Google Play Internal Testing when you push a tag like v1.2.0.
+# Builds a signed AAB for Google Play Internal Testing. Run it by hand (Actions tab -> "Release
+# bundle" -> Run workflow) or by pushing a tag like v1.2.0.
 # Required repository secrets:
 #   CARLINK_KEYSTORE_BASE64   base64 of your upload keystore (base64 -w0 upload.jks)
 #   CARLINK_STORE_PASSWORD, CARLINK_KEY_ALIAS, CARLINK_KEY_PASSWORD
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
 
