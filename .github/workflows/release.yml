@@ -1,0 +1,38 @@
+name: Release bundle
+
+# Builds a signed AAB for Google Play Internal Testing. Run it by hand (Actions tab -> "Release
+# bundle" -> Run workflow) or by pushing a tag like v1.2.0.
+# Required repository secrets:
+#   CARLINK_KEYSTORE_BASE64   base64 of your upload keystore (base64 -w0 upload.jks)
+#   CARLINK_STORE_PASSWORD, CARLINK_KEY_ALIAS, CARLINK_KEY_PASSWORD
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Decode keystore
+        run: echo "${{ secrets.CARLINK_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/upload.jks"
+
+      - name: Test and bundle
+        env:
+          CARLINK_STORE_FILE: ${{ runner.temp }}/upload.jks
+          CARLINK_STORE_PASSWORD: ${{ secrets.CARLINK_STORE_PASSWORD }}
+          CARLINK_KEY_ALIAS: ${{ secrets.CARLINK_KEY_ALIAS }}
+          CARLINK_KEY_PASSWORD: ${{ secrets.CARLINK_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon testDebugUnitTest bundleRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carlink-release-aab
+          path: app/build/outputs/bundle/release/*.aab

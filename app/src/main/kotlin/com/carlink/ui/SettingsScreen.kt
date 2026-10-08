@@ -143,6 +143,7 @@ import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.ui.components.LoadingSpinner
 import com.carlink.ui.settings.AdapterConfigPreference
+import com.carlink.ui.settings.BehaviorPreferences
 import com.carlink.ui.settings.AudioSourceConfig
 import com.carlink.ui.settings.CallQualityConfig
 import com.carlink.ui.settings.DisplayMode
@@ -486,6 +487,36 @@ private fun ControlTabContent(carlinkManager: CarlinkManager) {
                         )
                     }
                 }
+            }
+            // Audio behaviour
+            var audioFocusOn by remember { mutableStateOf(BehaviorPreferences.audioFocusEnabled(context)) }
+            ControlCard(
+                modifier = Modifier.fillMaxWidth(),
+                title = "Audio Focus",
+                icon = Icons.Default.Settings,
+            ) {
+                FilledTonalButton(
+                    onClick = {
+                        audioFocusOn = !audioFocusOn
+                        carlinkManager.setAudioFocusEnabled(audioFocusOn)
+                    },
+                    modifier = Modifier.fillMaxWidth().height(AutomotiveDimens.ButtonMinHeight),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+                ) {
+                    Text(
+                        text = if (audioFocusOn) "On (tap to turn off)" else "Off (tap to turn on)",
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text =
+                        "Makes the car pause or duck its own Bluetooth/radio audio while CarPlay plays. " +
+                            "Turn off if audio cuts out when switching sources.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

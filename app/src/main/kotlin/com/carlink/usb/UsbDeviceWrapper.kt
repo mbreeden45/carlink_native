@@ -51,6 +51,10 @@ class UsbDeviceWrapper(
     val productId: Int get() = device.productId
     val deviceName: String get() = device.deviceName
 
+    /** True when the last permission request was refused or timed out (drives reconnect backoff). */
+    @Volatile var permissionDenied: Boolean = false
+        private set
+
     // Performance tracking
     private var bytesSent: Long = 0
     private var bytesReceived: Long = 0
@@ -71,15 +75,16 @@ class UsbDeviceWrapper(
      * @param timeoutMs Timeout in milliseconds to wait for user response
      * @return true if permission was granted, false if denied or timeout
      */
-    suspend fun requestPermission(timeoutMs: Long = 30_000L): Boolean {
+    suspend fun requestPermission(timeoutMs: Long = PERMISSION_TIMEOUT_MS): Boolean {
         if (usbManager.hasPermission(device)) {
             log("Permission already granted for ${device.deviceName}")
             return true
         }
 
         log("Requesting USB permission for ${device.deviceName}...")
+        permissionDenied = false
 
-        return withTimeoutOrNull(timeoutMs) {
+        val granted = withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { continuation ->
                 val receiver =
                     object : BroadcastReceiver() {
@@ -137,10 +142,11 @@ class UsbDeviceWrapper(
                     }
                 }
             }
-        } ?: run {
-            log("USB permission request timed out")
-            false
         }
+        if (granted == null) log("USB permission request timed out")
+        val result = granted == true
+        permissionDenied = !result
+        return result
     }
 
     /**
@@ -548,6 +554,13 @@ class UsbDeviceWrapper(
     }
 
     companion object {
+        /**
+         * How long to wait for someone to answer the system permission dialog. Long on purpose: the
+         * dialog can sit on the head unit while the driver is busy, and answering it late must still
+         * work. (A short timeout used to discard a late "Allow" and then re-prompt.)
+         */
+        private const val PERMISSION_TIMEOUT_MS = 5 * 60_000L
+
         /**
          * Find all connected Carlinkit devices.
          */

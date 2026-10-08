@@ -4,8 +4,13 @@ import android.content.Context
 import android.hardware.usb.UsbManager
 import android.os.PowerManager
 import android.view.Surface
+import com.carlink.audio.AudioFocusController
 import com.carlink.audio.DualStreamAudioManager
 import com.carlink.audio.MicrophoneCaptureManager
+import com.carlink.connection.ConnectResult
+import com.carlink.connection.ConnectionHooks
+import com.carlink.connection.ConnectionSupervisor
+import com.carlink.connection.WatchdogSnapshot
 import com.carlink.logging.Logger
 import com.carlink.logging.logDebug
 import com.carlink.logging.logError
@@ -32,6 +37,7 @@ import com.carlink.protocol.UnpluggedMessage
 import com.carlink.protocol.VideoDataMessage
 import com.carlink.protocol.VideoStreamingSignal
 import com.carlink.ui.settings.AdapterConfigPreference
+import com.carlink.ui.settings.BehaviorPreferences
 import com.carlink.ui.settings.MicSourceConfig
 import com.carlink.ui.settings.WiFiBandConfig
 import com.carlink.usb.UsbDeviceWrapper
@@ -41,11 +47,14 @@ import com.carlink.video.H264Renderer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Timer
 import java.util.TimerTask
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -68,7 +77,6 @@ class CarlinkManager(
     // Config can be updated when actual surface dimensions are known
     private var config: AdapterConfig = initialConfig
     private var lastSurfaceRebindMs = 0L
-    private var pendingStartUntilSurface = false
     private var videoPaused = false
 
     // When true, perform a one-time decoder recovery the next time streaming starts.
@@ -92,10 +100,11 @@ class CarlinkManager(
         private const val RESET_THRESHOLD = 3
         private const val RESET_WINDOW_MS = 30_000L
 
-        // Auto-reconnect constants
-        private const val MAX_RECONNECT_ATTEMPTS = 5
-        private const val INITIAL_RECONNECT_DELAY_MS = 2000L // Start with 2 seconds
-        private const val MAX_RECONNECT_DELAY_MS = 30000L // Cap at 30 seconds
+        // How long a connection attempt waits for the video Surface/renderer to exist
+        private const val SURFACE_WAIT_MS = 20_000L
+
+        // Let the system finish enumerating the adapter after a USB attach event
+        private const val ATTACH_SETTLE_MS = 600L
 
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
@@ -171,12 +180,13 @@ class CarlinkManager(
     private var audioManager: DualStreamAudioManager? = null
     private var audioInitialized = false
 
+    // Audio focus (so the car pauses/ducks competing sources instead of fighting CarPlay audio)
+    private var audioFocus: AudioFocusController? = null
+
     // Microphone
     private var microphoneManager: MicrophoneCaptureManager? = null
-    private var isMicrophoneCapturing = false
     private var currentMicDecodeType = 5 // 16kHz mono
     private var currentMicAudioType = 3 // Siri/voice input
-    private var micSendTimer: Timer? = null
 
     // MediaSession
     private var mediaSessionManager: MediaSessionManager? = null
@@ -192,9 +202,50 @@ class CarlinkManager(
     private var lastResetTime: Long = 0
     private var consecutiveResets: Int = 0
 
-    // Auto-reconnect on USB disconnect
-    private var reconnectJob: Job? = null
-    private var reconnectAttempts: Int = 0
+    // Connection lifecycle. The supervisor lives in a manager-owned scope (NOT the UI scope) so a
+    // recomposition or cancelled LaunchedEffect can never abandon a half-open connection.
+    private val connectionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val teardownLock = Any()
+
+    // Mic start/stop run here, strictly in order, and never on the USB read thread: starting capture
+    // can spend a few hundred ms probing audio sources, which would stall video reads.
+    private val micDispatcher = Executors.newSingleThreadExecutor { Thread(it, "MicControl") }.asCoroutineDispatcher()
+    private val micScope = CoroutineScope(SupervisorJob() + micDispatcher)
+
+    // Last time any message arrived from the adapter / when the protocol was started (uptime ms)
+    @Volatile private var lastRxMs = 0L
+
+    @Volatile private var adapterStartedAtMs = 0L
+
+    private val supervisor: ConnectionSupervisor =
+        ConnectionSupervisor(
+            scope = connectionScope,
+            hooks =
+                object : ConnectionHooks {
+                    override suspend fun connect(): ConnectResult = connectOnce()
+
+                    override fun teardown() = this@CarlinkManager.teardown()
+
+                    override fun markDisconnected() = setState(State.DISCONNECTED)
+
+                    override fun snapshot(nowMs: Long): WatchdogSnapshot =
+                        WatchdogSnapshot(
+                            wanted = this@CarlinkManager.supervisor.isWanted,
+                            attemptActive = this@CarlinkManager.supervisor.isAttemptActive,
+                            reconnectPending = this@CarlinkManager.supervisor.isReconnectPending,
+                            disconnected = state == State.DISCONNECTED,
+                            streaming = state == State.STREAMING,
+                            adapterStartedAtMs = adapterStartedAtMs,
+                            lastRxMs = lastRxMs,
+                            nowMs = nowMs,
+                        )
+
+                    override fun log(message: String) {
+                        logInfo(message, tag = Logger.Tags.USB)
+                    }
+                },
+            clock = { android.os.SystemClock.uptimeMillis() },
+        ).also { it.start() }
 
     // Surface update debouncing - prevents repeated codec recreation during rapid surface size changes
     private var surfaceUpdateJob: Job? = null
@@ -353,19 +404,6 @@ class CarlinkManager(
         videoPaused = false
         videoInitialized = true
 
-        // If something requested start() before the surface existed, start now.
-        if (pendingStartUntilSurface) {
-            pendingStartUntilSurface = false
-            scope.launch {
-                delay(150) // small settle time for Surface/codec
-                try {
-                    start()
-                } catch (e: Exception) {
-                    logError("[START] Deferred start failed: ${e.message}", tag = Logger.Tags.USB)
-                }
-            }
-        }
-
         // If we are already connected/streaming, request a keyframe now that decoder is ready.
         if (state == State.DEVICE_CONNECTED || state == State.STREAMING) {
             val sent1 = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
@@ -388,6 +426,17 @@ class CarlinkManager(
                 logCallback,
                 audioConfig,
             )
+
+        audioFocus =
+            AudioFocusController(
+                context,
+                log = { logInfo(it, tag = Logger.Tags.AUDIO) },
+                onMediaFocusLostPermanently = {
+                    // The car switched to another media source for good: stop the phone streaming.
+                    logInfo("[FOCUS] Media focus lost - pausing phone", tag = Logger.Tags.AUDIO)
+                    sendKey(CommandMapping.PAUSE)
+                },
+            ).also { it.enabled = focusShouldBeHeld(config) }
 
         // Initialize microphone manager
         microphoneManager =
@@ -438,33 +487,77 @@ class CarlinkManager(
     }
 
     /**
-     * Start connection to the adapter.
+     * Ask for a connection to the adapter. Returns immediately; the connection runs in a
+     * manager-owned scope, retries on failure, and is a no-op if a session is already healthy.
      */
-    suspend fun start() {
-        // Hard guard: do not start streaming until the renderer exists.
-        // Starting early can discard SPS/PPS + first IDR and lead to a persistent black screen.
-        if (h264Renderer == null) {
-            logWarn(
-                "[START] Renderer not initialized (Surface not ready). Deferring start until initialize() runs.",
-                tag = Logger.Tags.VIDEO,
-            )
-            pendingStartUntilSurface = true
+    fun start() {
+        supervisor.connect("start")
+    }
+
+    /** In Bluetooth audio mode no audio reaches this app, so it must not hold focus; otherwise user choice. */
+    private fun focusShouldBeHeld(cfg: AdapterConfig): Boolean =
+        BehaviorPreferences.audioFocusEnabled(context) && !cfg.audioTransferMode
+
+    /** Settings toggle: applies immediately (disabling releases any focus currently held). */
+    fun setAudioFocusEnabled(enabled: Boolean) {
+        BehaviorPreferences.setAudioFocusEnabled(context, enabled)
+        audioFocus?.enabled = focusShouldBeHeld(config)
+        logInfo("[FOCUS] Audio focus ${if (enabled) "enabled" else "disabled"} by user", tag = Logger.Tags.AUDIO)
+    }
+
+    /**
+     * The app became visible. If a session is live, re-send the foreground-service start so it can
+     * (re)acquire the microphone type, which Android only allows while the app is visible.
+     */
+    fun onAppVisible() {
+        if (state == State.STREAMING || state == State.DEVICE_CONNECTED) {
+            CarlinkMediaBrowserService.startConnectionForeground(context)
+        }
+    }
+
+    /**
+     * USB attach event from the system (delivered to the Activity via its intent filter).
+     * Connects unless we already hold a working session on that exact device.
+     */
+    fun onUsbDeviceAttached(deviceName: String?) {
+        logInfo("[USB] Attach event for $deviceName", tag = Logger.Tags.USB)
+        val current = usbDevice
+        if (state != State.DISCONNECTED && current != null && current.deviceName == deviceName) {
+            logInfo("[USB] Attach event for the device we already hold - ignoring", tag = Logger.Tags.USB)
             return
         }
-        pendingStartUntilSurface = false
+        connectionScope.launch {
+            delay(ATTACH_SETTLE_MS)
+            supervisor.connect("usb-attach", skipIfHealthy = false)
+        }
+    }
+
+    /**
+     * One connection attempt. Runs on [connectionScope] (IO) under the supervisor's mutex, after
+     * [teardown]. Returns the outcome; the supervisor owns retry/backoff.
+     */
+    private suspend fun connectOnce(): ConnectResult {
+        // The renderer is created when the Surface exists. Starting before that can discard the
+        // first SPS/PPS + IDR and leave a persistent black screen, so wait for it.
+        var waited = 0L
+        while (h264Renderer == null && waited < SURFACE_WAIT_MS) {
+            delay(200)
+            waited += 200
+        }
+        if (h264Renderer == null) {
+            logWarn("[START] Renderer still not initialized after ${waited}ms (no Surface)", tag = Logger.Tags.VIDEO)
+            return ConnectResult.FAILED
+        }
 
         // New session attempt (often after vehicle sleep). Arm a one-time post-stream recovery.
         needsPostStreamRecovery = true
         didPostStreamRecovery = false
+        lastRxMs = 0L
+        adapterStartedAtMs = 0L
 
         setState(State.CONNECTING)
 
-        // Stop any existing connection
-        if (adapterDriver != null) {
-            stop()
-        }
-
-        // Reset video renderer (only if initialized)
+        // Reset video renderer
         h264Renderer?.reset()
         lastDecoderResetMs = android.os.SystemClock.uptimeMillis()
 
@@ -481,8 +574,7 @@ class CarlinkManager(
         val device = findDevice()
         if (device == null) {
             logError("Failed to find Carlinkit device", tag = Logger.Tags.USB)
-            setState(State.DISCONNECTED)
-            return
+            return ConnectResult.NO_DEVICE
         }
 
         log("Device found, opening")
@@ -490,8 +582,7 @@ class CarlinkManager(
 
         if (!device.openWithPermission()) {
             logError("Failed to open USB device", tag = Logger.Tags.USB)
-            setState(State.DISCONNECTED)
-            return
+            return if (device.permissionDenied) ConnectResult.PERMISSION_DENIED else ConnectResult.FAILED
         }
 
         // Create video processor for direct USB -> ring buffer data flow
@@ -499,7 +590,7 @@ class CarlinkManager(
         val videoProcessor = createVideoProcessor()
 
         // Create and start adapter driver
-        adapterDriver =
+        val driver =
             AdapterDriver(
                 usbDevice = device,
                 messageHandler = ::handleMessage,
@@ -507,6 +598,7 @@ class CarlinkManager(
                 logCallback = ::log,
                 videoProcessor = videoProcessor,
             )
+        adapterDriver = driver
 
         // Determine initialization mode based on first-run state and pending changes
         val adapterConfigPref = AdapterConfigPreference.getInstance(context)
@@ -534,16 +626,23 @@ class CarlinkManager(
                 callQuality = userConfig.callQuality.value,
             )
         config = refreshedConfig // Update stored config for other uses
+        audioFocus?.enabled = focusShouldBeHeld(refreshedConfig)
 
         log("[INIT] Mode: ${adapterConfigPref.getInitializationInfo()}")
         log("[INIT] Audio mode: ${if (refreshedConfig.audioTransferMode) "BLUETOOTH" else "ADAPTER"}")
 
-        adapterDriver?.start(refreshedConfig, initMode.name, pendingChanges)
+        // Stamp BEFORE the (slow, blocking) init sequence so any message that arrives afterwards
+        // is guaranteed to count as "heard from the adapter".
+        adapterStartedAtMs = android.os.SystemClock.uptimeMillis()
+        driver.start(refreshedConfig, initMode.name, pendingChanges)
+        if (!driver.running) {
+            logError("Adapter driver failed to start", tag = Logger.Tags.ADAPTR)
+            return ConnectResult.FAILED
+        }
 
         // Mark first init completed and clear pending changes after successful start
-        // This runs in a coroutine to handle the suspend functions
         videoPaused = false
-        CoroutineScope(Dispatchers.IO).launch {
+        connectionScope.launch {
             if (initMode == AdapterConfigPreference.InitMode.FULL) {
                 adapterConfigPref.markFirstInitCompleted()
             }
@@ -565,44 +664,58 @@ class CarlinkManager(
                     PAIR_TIMEOUT_MS,
                 )
             }
+        return ConnectResult.CONNECTED
     }
 
     /**
-     * Stop and disconnect.
+     * Release the adapter session (protocol, USB, audio, mic). Idempotent and thread-safe; does not
+     * touch connection state or retry policy -- the supervisor owns both.
+     */
+    private fun teardown() {
+        synchronized(teardownLock) {
+            logDebug("[LIFECYCLE] teardown() - clearing frame interval and phoneType", tag = Logger.Tags.VIDEO)
+            didPostStreamRecovery = false
+            clearPairTimeout()
+            stopFrameInterval()
+            currentPhoneType = null // Clear phone type on disconnect
+            clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
+            stopMicrophoneCapture()
+
+            adapterDriver?.stop()
+            adapterDriver = null
+
+            usbDevice?.close()
+            usbDevice = null
+
+            adapterStartedAtMs = 0L
+
+            audioFocus?.abandonAll()
+
+            // Stop audio
+            if (audioInitialized) {
+                audioManager?.release()
+                audioInitialized = false
+                logInfo("Audio released on teardown", tag = Logger.Tags.AUDIO)
+            }
+        }
+    }
+
+    /**
+     * Intentional stop: disconnects and does NOT reconnect automatically. A USB re-attach, or an
+     * explicit [start]/[restart], resumes.
      */
     fun stop() {
-        logDebug("[LIFECYCLE] stop() called - clearing frame interval and phoneType", tag = Logger.Tags.VIDEO)
-        didPostStreamRecovery = false
-        clearPairTimeout()
-        stopFrameInterval()
-        cancelReconnect() // Cancel any pending auto-reconnect
-        currentPhoneType = null // Clear phone type on disconnect
-        clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
-        stopMicrophoneCapture()
-
-        adapterDriver?.stop()
-        adapterDriver = null
-
-        usbDevice?.close()
-        usbDevice = null
-
-        // Stop audio
-        if (audioInitialized) {
-            audioManager?.release()
-            audioInitialized = false
-            logInfo("Audio released on stop", tag = Logger.Tags.AUDIO)
-        }
-
+        supervisor.stop()
+        teardown()
         setState(State.DISCONNECTED)
     }
 
     /**
-     * Restart the connection.
+     * Tear the session down and reconnect. The reconnect itself runs in the manager's own scope, so
+     * cancelling the caller (e.g. leaving a screen) cannot leave the connection half-open.
      */
     suspend fun restart() {
-        stop()
-        kotlinx.coroutines.delay(2000)
-        start()
+        supervisor.restart("manual")?.join()
     }
 
     /**
@@ -633,10 +746,18 @@ class CarlinkManager(
      * Release all resources.
      */
     fun release() {
-        stop()
+        supervisor.close()
+        teardown()
+        setState(State.DISCONNECTED)
+        connectionScope.coroutineContext[Job]?.cancel()
+        micScope.coroutineContext[Job]?.cancel()
+        micDispatcher.close()
 
         h264Renderer?.stop()
         h264Renderer = null
+
+        audioFocus?.abandonAll()
+        audioFocus = null
 
         audioManager?.release()
         audioManager = null
@@ -936,6 +1057,7 @@ class CarlinkManager(
     }
 
     private fun handleMessage(message: Message) {
+        lastRxMs = android.os.SystemClock.uptimeMillis()
         when (message) {
             is PluggedMessage -> {
                 logInfo(
@@ -945,8 +1067,8 @@ class CarlinkManager(
                 clearPairTimeout()
                 stopFrameInterval() // Stop any existing timer (clean slate)
 
-                // Reset reconnect attempts on successful connection
-                reconnectAttempts = 0
+                // Healthy session: reset reconnect backoff
+                supervisor.onHealthy()
 
                 // Store phone type for frame interval decisions during recovery
                 currentPhoneType = message.phoneType
@@ -968,9 +1090,7 @@ class CarlinkManager(
             }
 
             is UnpluggedMessage -> {
-                scope.launch {
-                    restart()
-                }
+                supervisor.restart("adapter-unplugged")
             }
 
             is VideoDataMessage -> {
@@ -1021,12 +1141,16 @@ class CarlinkManager(
             is CommandMessage -> {
                 if (message.command == CommandMapping.REQUEST_HOST_UI) {
                     callback?.onHostUIPressed()
+                } else if (message.command == CommandMapping.START_RECORD_AUDIO) {
+                    logInfo("[CMD] Adapter requests microphone (START_RECORD_AUDIO)", tag = Logger.Tags.MIC)
+                    micScope.launch { startMicrophoneCapture(decodeType = 5, audioType = 3) }
+                } else if (message.command == CommandMapping.STOP_RECORD_AUDIO) {
+                    logInfo("[CMD] Adapter released microphone (STOP_RECORD_AUDIO)", tag = Logger.Tags.MIC)
+                    micScope.launch { stopMicrophoneCapture() }
                 } else if (message.command == CommandMapping.PROJECTION_DISCONNECTED) {
                     needsPostStreamRecovery = true
                     didPostStreamRecovery = false
-                    scope.launch {
-                        restart()
-                    }
+                    supervisor.restart("projection-disconnected")
                 }
             }
 
@@ -1052,6 +1176,9 @@ class CarlinkManager(
         // Skip if no audio data
         val audioData = message.data ?: return
 
+        // Hold audio focus for as long as this stream is producing audio
+        AudioFocusController.channelForAudioType(message.audioType)?.let { audioFocus?.request(it) }
+
         // Write audio
         audioManager?.writeAudio(audioData, message.audioType, message.decodeType)
     }
@@ -1068,28 +1195,31 @@ class CarlinkManager(
             AudioCommand.AUDIO_NAVI_STOP -> {
                 logInfo("[AUDIO_CMD] Navigation audio STOP command received", tag = Logger.Tags.AUDIO)
                 audioManager?.stopNavTrack()
+                audioFocus?.abandon(AudioFocusController.Channel.NAVIGATION)
             }
 
             AudioCommand.AUDIO_SIRI_START -> {
                 logInfo("[AUDIO_CMD] Siri started - enabling microphone", tag = Logger.Tags.MIC)
-                startMicrophoneCapture(decodeType = 5, audioType = 3)
+                micScope.launch { startMicrophoneCapture(decodeType = 5, audioType = 3) }
             }
 
             AudioCommand.AUDIO_PHONECALL_START -> {
                 logInfo("[AUDIO_CMD] Phone call started - enabling microphone", tag = Logger.Tags.MIC)
-                startMicrophoneCapture(decodeType = 5, audioType = 3)
+                micScope.launch { startMicrophoneCapture(decodeType = 5, audioType = 3) }
             }
 
             AudioCommand.AUDIO_SIRI_STOP -> {
                 logInfo("[AUDIO_CMD] Siri stopped - disabling microphone", tag = Logger.Tags.MIC)
-                stopMicrophoneCapture()
+                micScope.launch { stopMicrophoneCapture() }
                 audioManager?.stopVoiceTrack()
+                audioFocus?.abandon(AudioFocusController.Channel.ASSISTANT)
             }
 
             AudioCommand.AUDIO_PHONECALL_STOP -> {
                 logInfo("[AUDIO_CMD] Phone call stopped - disabling microphone", tag = Logger.Tags.MIC)
-                stopMicrophoneCapture()
+                micScope.launch { stopMicrophoneCapture() }
                 audioManager?.stopCallTrack()
+                audioFocus?.abandon(AudioFocusController.Channel.CALL)
             }
 
             AudioCommand.AUDIO_MEDIA_START -> {
@@ -1099,7 +1229,13 @@ class CarlinkManager(
 
             AudioCommand.AUDIO_MEDIA_STOP -> {
                 logDebug("[AUDIO_CMD] Media audio STOP command received", tag = Logger.Tags.AUDIO)
+                // Playback paused/stopped on the phone: let the car's own sources have the output back
+                audioFocus?.abandon(AudioFocusController.Channel.MEDIA)
                 // Media track typically stays active, but log for debugging
+            }
+
+            AudioCommand.AUDIO_INPUT_CONFIG -> {
+                logInfo("[AUDIO_CMD] Audio input config received (mic format negotiation)", tag = Logger.Tags.MIC)
             }
 
             AudioCommand.AUDIO_OUTPUT_START -> {
@@ -1116,64 +1252,50 @@ class CarlinkManager(
         }
     }
 
+    /**
+     * Start streaming the head-unit microphone to the adapter.
+     *
+     * Triggered by Siri/phone-call audio commands AND by the adapter's START_RECORD_AUDIO command,
+     * which is what the phone raises when any other app (voice messages, Snapchat, ...) opens the
+     * CarPlay microphone. Previously only the first two were handled, so those apps got silence.
+     */
+    @Synchronized
     private fun startMicrophoneCapture(
         decodeType: Int,
         audioType: Int,
     ) {
-        if (isMicrophoneCapturing) {
+        val mic = microphoneManager ?: return
+        if (config.micType == "box") {
+            logInfo("Mic source is the adapter's own mic - not capturing from the head unit", tag = Logger.Tags.MIC)
+            return
+        }
+        if (mic.isCapturing()) {
             if (currentMicDecodeType == decodeType && currentMicAudioType == audioType) {
                 return
             }
-            stopMicrophoneCapture()
+            mic.stop()
         }
 
-        val started = microphoneManager?.start() ?: false
+        currentMicDecodeType = decodeType
+        currentMicAudioType = audioType
+
+        val started =
+            mic.start(decodeType) { pcm ->
+                // Runs on the mic capture thread; the capture clock paces USB sends.
+                adapterDriver?.sendAudio(data = pcm, decodeType = currentMicDecodeType, audioType = currentMicAudioType)
+            }
         if (started) {
-            isMicrophoneCapturing = true
-            currentMicDecodeType = decodeType
-            currentMicAudioType = audioType
-
-            // Start send loop
-            micSendTimer =
-                Timer().apply {
-                    scheduleAtFixedRate(
-                        object : TimerTask() {
-                            override fun run() {
-                                sendMicrophoneData()
-                            }
-                        },
-                        0,
-                        20,
-                    ) // 20ms interval
-                }
-
-            logInfo("Microphone capture started", tag = Logger.Tags.MIC)
+            logInfo("Microphone capture started (decodeType=$decodeType audioType=$audioType)", tag = Logger.Tags.MIC)
+        } else {
+            logError("Microphone capture FAILED to start", tag = Logger.Tags.MIC)
         }
     }
 
+    @Synchronized
     private fun stopMicrophoneCapture() {
-        if (!isMicrophoneCapturing) return
-
-        micSendTimer?.cancel()
-        micSendTimer = null
-
-        microphoneManager?.stop()
-        isMicrophoneCapturing = false
-
+        val mic = microphoneManager ?: return
+        mic.stop()
         logInfo("Microphone capture stopped", tag = Logger.Tags.MIC)
-    }
-
-    private fun sendMicrophoneData() {
-        if (!isMicrophoneCapturing) return
-
-        val data = microphoneManager?.readChunk(maxBytes = 640) ?: return
-        if (data.isNotEmpty()) {
-            adapterDriver?.sendAudio(
-                data = data,
-                decodeType = currentMicDecodeType,
-                audioType = currentMicAudioType,
-            )
-        }
     }
 
     private fun processMediaMetadata(message: MediaDataMessage) {
@@ -1261,92 +1383,10 @@ class CarlinkManager(
         stopFrameInterval()
         currentPhoneType = null
 
-        // Set state to disconnected
-        setState(State.DISCONNECTED)
-
-        // Schedule auto-reconnect for USB disconnect errors
-        if (isUsbDisconnectError(error)) {
-            scheduleReconnect()
-        }
-    }
-
-    /**
-     * Checks if an error indicates USB disconnect (physical or transfer failure).
-     */
-    private fun isUsbDisconnectError(error: String): Boolean {
-        val lowerError = error.lowercase()
-        return lowerError.contains("disconnect") ||
-            lowerError.contains("detach") ||
-            lowerError.contains("transfer") ||
-            lowerError.contains("usb")
-    }
-
-    /**
-     * Schedule an auto-reconnect attempt with exponential backoff.
-     *
-     * After USB disconnect, attempts to reconnect automatically:
-     * - Attempt 1: 2 seconds delay
-     * - Attempt 2: 4 seconds delay
-     * - Attempt 3: 8 seconds delay
-     * - Attempt 4: 16 seconds delay
-     * - Attempt 5: 30 seconds delay (capped)
-     *
-     * Gives up after MAX_RECONNECT_ATTEMPTS to prevent infinite loops.
-     */
-    private fun scheduleReconnect() {
-        // Cancel any existing reconnect attempt
-        reconnectJob?.cancel()
-
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            logWarn(
-                "[RECONNECT] Max attempts ($MAX_RECONNECT_ATTEMPTS) reached, giving up. " +
-                    "User must manually restart.",
-                tag = Logger.Tags.USB,
-            )
-            reconnectAttempts = 0
-            return
-        }
-
-        // Calculate delay with exponential backoff, capped at max
-        val delay =
-            minOf(
-                INITIAL_RECONNECT_DELAY_MS * (1L shl reconnectAttempts),
-                MAX_RECONNECT_DELAY_MS,
-            )
-        reconnectAttempts++
-
-        logInfo(
-            "[RECONNECT] Scheduling attempt $reconnectAttempts/$MAX_RECONNECT_ATTEMPTS in ${delay}ms",
-            tag = Logger.Tags.USB,
-        )
-
-        reconnectJob =
-            scope.launch {
-                kotlinx.coroutines.delay(delay)
-
-                // Only attempt if still disconnected
-                if (state == State.DISCONNECTED) {
-                    logInfo("[RECONNECT] Attempting reconnection...", tag = Logger.Tags.USB)
-                    try {
-                        start()
-                    } catch (e: Exception) {
-                        logError("[RECONNECT] Reconnection failed: ${e.message}", tag = Logger.Tags.USB)
-                        // handleError will be called by start() failure, which will schedule next attempt
-                    }
-                } else {
-                    logInfo("[RECONNECT] Already connected, cancelling reconnect", tag = Logger.Tags.USB)
-                    reconnectAttempts = 0
-                }
-            }
-    }
-
-    /**
-     * Cancel any pending reconnect attempt.
-     */
-    private fun cancelReconnect() {
-        reconnectJob?.cancel()
-        reconnectJob = null
-        reconnectAttempts = 0
+        // Any non-recoverable adapter/USB error means the session is dead. The supervisor marks us
+        // disconnected and retries with capped backoff until the adapter is back. Idempotent: bursts
+        // of errors (every failed send reports one) collapse into a single reconnect.
+        supervisor.onConnectionLost(error)
     }
 
     /**
@@ -1409,7 +1449,7 @@ class CarlinkManager(
      * Matches Flutter: CarlinkPlugin.kt performEmergencyCleanup()
      *
      * Simple cleanup - just reset video and close USB.
-     * Does NOT attempt automatic restart (let user/system decide).
+     * Then asks the connection supervisor to reconnect so no manual action is needed.
      */
     private fun performEmergencyCleanup() {
         try {
@@ -1436,6 +1476,8 @@ class CarlinkManager(
             }
 
             logWarn("[EMERGENCY CLEANUP] Conservative cleanup finished", tag = Logger.Tags.ADAPTR)
+            // Self-heal: a car should not need a human to recover from a codec/USB cascade failure.
+            supervisor.restart("emergency-cleanup")
         } catch (e: Exception) {
             logError("[EMERGENCY CLEANUP] State error: ${e.message}", tag = Logger.Tags.ADAPTR)
         }
@@ -1515,6 +1557,8 @@ class CarlinkManager(
                     payloadLength: Int,
                     readCallback: (buffer: ByteArray, offset: Int, length: Int) -> Int,
                 ) {
+                    lastRxMs = android.os.SystemClock.uptimeMillis()
+
                     // Gate: Drop video while paused or renderer missing
                     if (videoPaused || h264Renderer == null) {
                         var remaining = payloadLength

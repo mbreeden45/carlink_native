@@ -1,104 +1,125 @@
 # Carlink Native
 
-**A native Android implementation of a Carlink alternative, without Flutter/Dart dependencies.**
+A native Android (Kotlin/Java) CarPlay / Android Auto projection client for **Android Automotive OS**
+head units, talking to a **Carlinkit CPC200-CCPA** USB adapter. No Flutter/Dart.
 
-[![Kotlin](https://img.shields.io/badge/Kotlin-81.2%25-blue?logo=kotlin)](https://kotlinlang.org/)
-[![Java](https://img.shields.io/badge/Java-18.8%25-orange?logo=java)](https://www.java.com/)
-[![Android](https://img.shields.io/badge/Platform-Android-green?logo=android)](https://developer.android.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Built and tuned for a **2025 Chevrolet Equinox EV** (GM AAOS) with an iPhone. The goal is
+"set-and-forget": get in the car, CarPlay comes up, no prompts, no rituals.
 
-This project is a **lightly updated fork** of the excellent native Android port created by [@lvalen91](https://github.com/lvalen91).  
-The majority of the core architecture, protocol implementation, video/audio handling, and USB communication was developed by him in:
+> **Status:** unit-tested and builds cleanly, but the recent reliability/mic changes have **not yet
+> been run on a vehicle**. See [`documents/troubleshooting.md`](documents/troubleshooting.md) for what
+> changed, why, and what to watch on the first drive.
 
-- https://github.com/lvalen91/Carlink (Flutter-based rewrite with native branch)
-- https://github.com/lvalen91/Carlink_native (pure native Kotlin/Java version)
+## What this fork changes
 
-**Huge thanks to lvalen91** — this fork would not exist without his extensive reverse-engineering and clean native implementation.
+Compared with the upstream it was forked from:
 
-This fork adds quality-of-life improvements, increased reliability on GM AAOS head units, and preparation for potential Google Play publishing.
+| Problem | Cause found in the code | Fix |
+|---|---|---|
+| Stuck on **Connecting…**, needed cable pull + force stop | Connect ran in a UI coroutine that Compose cancelled mid-connect; racing start/stop callers; init sequence sleeping on the main thread; reconnect gave up after 5 tries | `ConnectionSupervisor`: own scope, single-flight, IO thread, retries forever (2 s→30 s), watchdog for a silent/stalled adapter |
+| USB **"Allow" pop-up** every trip | Attach event handled by a receiver Android never delivers it to; 30 s permission timeout discarded late answers and re-prompted | Attach handled in `onCreate`/`onNewIntent`, `singleTask`, 5 min permission wait, 60 s back-off after refusal |
+| **Mic silent** in Snapchat / voice messages / calls | Adapter's `START_RECORD_AUDIO`/`STOP_RECORD_AUDIO` commands were ignored (only Siri/call started the mic); no `microphone` foreground-service type so Android silences capture when app isn't visible | Commands handled; capture-thread-driven send; source fallback + silence probe; `microphone` FGS type with safe fallback |
+| Audio plays via car **Bluetooth**, Spotify silent | No audio focus held; mic/audio-transfer settings were only sent on the very first run | `AudioFocusController` (toggle in Settings); both settings re-asserted every session. *Also requires forgetting the car's Bluetooth on the iPhone, see docs.* |
+| Foreground service never actually started on Android 14+ | `connectedDevice` type missing its prerequisite permission → `SecurityException` swallowed | Permission added, graceful fallback chain |
 
-**Work in Progress** – Builds are versioned in commit messages (e.g., Build 52).
-
-## Improvements in This Fork
-- **Video Reliability**:
-  - Enhanced resume logic with additional/delayed keyframe requests to greatly reduce black screens when returning from background or Settings.
-  - Exposed "Reset Video Stream" for instant decoder recovery (no full USB reconnect needed).
-  - Improved lifecycle handling for surface invalidation and decoder stalls.
-- **Google Play Readiness**:
-  - Harmonized package name, versioning, and build configuration.
-  - Clean native-only codebase.
-  - Optimized for AAOS 12L/14 (GM Intel-based systems) with hardware-accelerated H.264.
-- **Core Features (Thanks to lvalen91's Foundation)**:
-  - Full USB protocol for Carlinkit CPC200-CCPA adapters.
-  - Hardware-accelerated video (MediaCodec) and multi-stream audio.
-  - Multitouch support.
-  - Microphone capture for Siri/voice commands and calls.
-  - MediaSession integration.
-  - Periodic keyframe requests for stable CarPlay sessions.
-  - Auto-reconnect with exponential backoff.
-  - Detailed logging and performance stats.
-
-Enables **Apple CarPlay** and **Android Auto** projection, with Android Auto forced on every connection.
+Unchanged and inherited: USB protocol, H.264 `MediaCodec` video path (including the black-screen /
+resume fixes from builds 52–61), multi-stream audio, multitouch, MediaSession.
 
 ## Requirements
-- Android Studio (latest, JDK 21+ recommended).
-- Android SDK: minSdk 32 (Android 12L), targetSdk 34 (Android 14).
-- Compatible hardware: Carlinkit CPC200-CCPA adapter + GM AAOS head unit (extensively tested on Intel-based systems).
 
-## Important Notes for GM Vehicles
-- **Driving restrictions**: A plain sideloaded APK will not run while the vehicle is in motion. To enable full functionality while driving:
-  1. Create a Google Play Developer Console account ($25 one-time fee).
-  2. Upload the AAB/APK to the **Internal Testing** track.
-  3. Add your Google account to the tester list.
-  4. Install/update via the Play Store on the head unit.
+- Android Studio (latest) or just JDK 21 + the Android SDK (platform 36, build-tools 36)
+- minSdk 32 (Android 12L), compile/target SDK 36
+- Carlinkit CPC200-CCPA adapter + AAOS head unit
 
-## Installation & Build
+## Build
 
-1. **Clone the Repo**:
-   git clone https://github.com/MotoInsight/Carlink_native.git
-   cd Carlink_native
+```bash
+export ANDROID_HOME=/path/to/android-sdk          # or sdk.dir in local.properties
+./gradlew testDebugUnitTest                        # 43 unit tests
+./gradlew assembleDebug                            # debug APK
+./gradlew bundleRelease                            # release AAB (signed if configured below)
+```
 
-2. **Customize for Publishing** (Google Play Internal Testing):
-   - Open `app/build.gradle.kts`.
-   - Update `defaultConfig`:
-     applicationId = "com.yourcompany.carlinknative"  // Unique package
-     versionCode = 52
-     versionName = "1.0.52"
-   - Sign the release build with your keystore.
+### Your own package name
 
-3. **Build**:
-   - Open in Android Studio → Sync Gradle.
-   - Build → Build Bundle(s) / APK(s) → `bundleRelease` or `assembleRelease`.
+The default `applicationId` is `com.myequinox.myapp`. Override per build or permanently:
 
-4. **Deploy**:
-   - Upload AAB to Google Play Internal Testing.
-   - Install via Play Store on the head unit.
+```bash
+./gradlew assembleDebug -Pcarlink.applicationId=com.yourname.carlink
+# or put  carlink.applicationId=com.yourname.carlink  in ~/.gradle/gradle.properties
+```
+
+> Android stores the USB "always open with" default **per package name**. Pick the name once;
+> changing it means one more prompt on the car.
+
+### Release signing
+
+Create a gitignored `signing.properties` in the repo root (or set the same values as env vars for CI):
+
+```properties
+storeFile=/absolute/path/to/upload.jks      # env: CARLINK_STORE_FILE
+storePassword=...                           # env: CARLINK_STORE_PASSWORD
+keyAlias=...                                # env: CARLINK_KEY_ALIAS
+keyPassword=...                             # env: CARLINK_KEY_PASSWORD
+```
+
+Without it, `assembleRelease` produces an unsigned APK.
+
+### CI
+
+- `.github/workflows/build.yml` – unit tests + debug APK on every push/PR.
+- `.github/workflows/release.yml` – push a tag like `v1.2.0` to build a signed AAB. Needs secrets
+  `CARLINK_KEYSTORE_BASE64`, `CARLINK_STORE_PASSWORD`, `CARLINK_KEY_ALIAS`, `CARLINK_KEY_PASSWORD`.
+
+## Getting it onto a GM vehicle
+
+A sideloaded APK will not run while the vehicle is moving. To keep it usable while driving, install
+through Google Play **Internal Testing**:
+
+1. Create a Google Play Console developer account (one-time fee).
+2. Upload the AAB to an Internal Testing track and add your Google account as a tester.
+3. Install/update from the Play Store on the head unit. **Update over the top; don't uninstall**, or
+   the USB "Always" default is lost.
+4. First plug-in: tick **Always** on the USB prompt and allow the microphone.
+
+## iPhone setup that matters
+
+- **Forget the car's own Bluetooth** on the iPhone (Settings → Bluetooth → ⓘ → Forget This Device).
+  If the phone is also paired to "My Chevrolet"/"Equinox EV", iOS can send Spotify there instead of
+  through CarPlay and the adapter hears nothing.
+- *Control Center → Mic Mode* showing **"CarPlay replaced iPhone Microphone"** is expected; it means
+  the head-unit mic is feeding the phone. Don't override it.
+- In the app: **Settings → Adapter Configuration → Microphone Source = App**.
 
 ## Usage
-- Plug in adapter → auto-connect.
-- Settings: Immersive mode, audio routing, mic source, WiFi band.
-- **Reset Video Stream**: Instant video recovery from black screen.
-- **Reset Device** (red button): Full USB session restart.
 
-## Contributing
-- Fork and open PRs for fixes or enhancements.
-- Focus areas: AAOS stability, video reliability, Play Store compliance.
-- Include logs when reporting issues.
+- Plug in the adapter → the app connects on its own and reconnects after drops, restarts and car sleep.
+- **Reset Video Decoder** – instant video recovery without reconnecting USB.
+- **Reset USB Device** – full session restart (should rarely be needed now).
+- **Audio Focus** toggle – turn off if audio cuts out when switching sources.
 
-## Changelog (Recent Builds)
-- **Build 52** (January 4, 2026): Additional keyframe requests on resume; significant black screen reduction.
-- See commit history for earlier changes.
+Useful log tags when reporting issues: `[SUPERVISOR]`, `[WATCHDOG]`, `[USB_ATTACH]`, `[MIC]`, `[FOCUS]`.
 
-## Community & Support
-- OLD discussion thread: [XDA Developers - General Motors Google Built-in Tinkering](https://xdaforums.com/t/general-motors-google-built-in-tinkering.4668105/)
-- NEW Main discussion thread: [XDA Developers - Carlink](https://xdaforums.com/t/carlink.4774308/)
-- Reddit community: [r/SilveradoEV](https://www.reddit.com/r/SilveradoEV/)
-- Check out [OpenSourceEV.com](https://OpenSourceEV.com) for upcoming closed beta access to this project, Silverado EV 3D-printed projects, and open-source STL files.
+## Repository layout
 
-## License
-MIT License – Free to use, modify, and distribute.
+```
+app/src/main/kotlin/com/carlink/
+  connection/   ConnectionSupervisor – connect/retry/watchdog policy (unit-tested)
+  usb/          UsbDeviceWrapper – bulk transfer + permission
+  protocol/     message parser/serializer, AdapterDriver (init + heartbeat)
+  audio/        DualStreamAudioManager, MicrophoneCaptureManager, AudioFocusController
+  media/        MediaSession + foreground connection service
+  ui/           Compose screens and settings
+  CarlinkManager.kt   orchestrator
+app/src/main/java/com/carlink/video/   H264Renderer (MediaCodec)
+documents/      troubleshooting.md, revisions.txt, GM head-unit reference notes
+```
 
-## Credits & Acknowledgments
-- **Primary development & native port**: [@lvalen91](https://github.com/lvalen91) – massive thanks for the foundation!
-- This fork: Minor QoL improvements and GM-specific tuning by MotoInsight / OpenSourceEV.
-- Community: XDA thread contributors, OpenSourceEV team, and testers across GM vehicle forums.
+## Credits
+
+- Native port, protocol reverse-engineering, video/audio/USB core: [@lvalen91](https://github.com/lvalen91)
+  ([Carlink](https://github.com/lvalen91/Carlink), [Carlink_native](https://github.com/lvalen91/Carlink_native)).
+- GM AAOS tuning and the builds this fork started from: [MotoInsight/Carlink_native](https://github.com/MotoInsight/Carlink_native).
+- This fork: reliability, microphone and audio-routing work for the Equinox EV.
+
+Released under the MIT license, as upstream.

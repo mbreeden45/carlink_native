@@ -35,10 +35,6 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import com.carlink.logging.FileLogManager
 import com.carlink.logging.LogPreset
 import com.carlink.logging.Logger
@@ -74,9 +70,6 @@ class MainActivity : ComponentActivity() {
     private var carlinkManager: CarlinkManager? = null
     private var fileLogManager: FileLogManager? = null
     private var currentDisplayMode: DisplayMode = DisplayMode.SYSTEM_UI_VISIBLE
-    // Simple UI-scope for delayed restart work (no lifecycleScope dependency needed)
-    private val uiScope = MainScope()
-    private var usbAttachJob: Job? = null
     // Permission launcher
     private val micPermissionLauncher =
         registerForActivityResult(
@@ -86,49 +79,40 @@ class MainActivity : ComponentActivity() {
         }
 
     /**
-     * BroadcastReceiver for USB device attachment events.
+     * Handles a USB_DEVICE_ATTACHED launch/redelivery.
      *
-     * After vehicle sleep/ignition cycle the adapter may re-enumerate. This receiver
-     * provides a deterministic "adapter is back" signal to trigger reconnect.
+     * Android delivers ACTION_USB_DEVICE_ATTACHED ONLY to the activity named by the manifest
+     * intent-filter (cold start -> onCreate intent, already running -> onNewIntent). It is never
+     * broadcast to dynamically registered receivers, so the old attach receiver here never fired
+     * and a re-enumerated adapter was only noticed if the user reopened the app by hand.
+     *
+     * Being launched by this intent is also what grants this app permission to the device without
+     * any dialog, so reacting here is what makes reconnects silent.
      */
-    private val usbAttachReceiver =
-        object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                if (UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action) {
-                    val device =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                        }
-
-                    device?.let {
-                        if (KnownDevices.isKnownDevice(it.vendorId, it.productId)) {
-                            logInfo(
-                                "[USB_ATTACH] Carlinkit device attached: VID=0x${it.vendorId.toString(16)} " +
-                                    "PID=0x${it.productId.toString(16)} path=${it.deviceName}",
-                                tag = "MAIN",
-                            )
-
-                            // Debounce multiple attach events and give the system a moment to settle.
-                            usbAttachJob?.cancel()
-                            usbAttachJob =
-                                uiScope.launch {
-                                    delay(600)
-                                    try {
-                                        // Safe even if already connected; start() will stop old connection first.
-                                        carlinkManager?.start()
-                                    } catch (e: Exception) {
-                                        logWarn("[USB_ATTACH] start() failed: ${e.message}", tag = "MAIN")
-                                    }
-                                }
-                        }
-                    }
-                }
+    private fun handleUsbIntent(intent: Intent?) {
+        if (intent?.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return
+        val device =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
             }
-        }
+        if (device == null || !KnownDevices.isKnownDevice(device.vendorId, device.productId)) return
 
+        logInfo(
+            "[USB_ATTACH] Carlinkit attached via intent: VID=0x${device.vendorId.toString(16)} " +
+                "PID=0x${device.productId.toString(16)} path=${device.deviceName}",
+            tag = "MAIN",
+        )
+        carlinkManager?.onUsbDeviceAttached(device.deviceName)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleUsbIntent(intent)
+    }
 
     /**
      * BroadcastReceiver for USB device detachment events.
@@ -196,8 +180,8 @@ class MainActivity : ComponentActivity() {
 
         // Register USB detachment receiver for immediate disconnect detection
         registerUsbDetachReceiver()
-        // Register USB attachment
-        registerUsbAttachReceiver()
+        // A USB attach intent can be what launched us (adapter plugged in / car woke up)
+        handleUsbIntent(intent)
 
         // Set up Compose UI
         // carlinkManager is guaranteed non-null here since initializeCarlinkManager()
@@ -230,6 +214,8 @@ class MainActivity : ComponentActivity() {
         // BufferQueue can stall. Resume codec and request keyframe for immediate video.
         logInfo("[LIFECYCLE] onStart - resuming video", tag = "MAIN")
         carlinkManager?.resumeVideo()
+        // Visible again: the one moment a microphone-type foreground service may be (re)started.
+        carlinkManager?.onAppVisible()
     }
 
     override fun onStop() {
@@ -248,9 +234,6 @@ class MainActivity : ComponentActivity() {
 
         // Unregister USB detachment receiver
         unregisterUsbDetachReceiver()
-        
-        // Unregister USB attachement receiver
-        unregisterUsbAttachReceiver()
 
         // Release resources (null-safe in case Activity destroyed before init completed)
         carlinkManager?.release()
@@ -425,25 +408,6 @@ class MainActivity : ComponentActivity() {
         }
     }
     
-    private fun registerUsbAttachReceiver() {
-        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_ATTACHED)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(usbAttachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(usbAttachReceiver, filter)
-        }
-        logInfo("[USB_ATTACH] Registered USB attachment receiver", tag = "MAIN")
-    }
-
-    private fun unregisterUsbAttachReceiver() {
-        try {
-            unregisterReceiver(usbAttachReceiver)
-            logInfo("[USB_ATTACH] Unregistered USB attachment receiver", tag = "MAIN")
-        } catch (e: IllegalArgumentException) {
-            logWarn("[USB_ATTACH] Receiver already unregistered: ${e.message}", tag = "MAIN")
-        }
-    }    
-
     /**
      * Registers the USB detachment BroadcastReceiver.
      *
