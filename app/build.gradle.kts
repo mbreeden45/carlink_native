@@ -33,7 +33,12 @@ android {
         applicationId = providers.gradleProperty("carlink.applicationId").getOrElse("com.myequinox.myapp")
         minSdk = 32
         targetSdk = 36
-        versionCode = 62
+        // Play rejects a versionCode it has already seen. CI numbers its own builds (run number + 100,
+        // so the first CI build is 101); override with -Pcarlink.versionCode=N for local builds.
+        versionCode =
+            providers.gradleProperty("carlink.versionCode").orNull?.toIntOrNull()
+                ?: System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()?.plus(100)
+                ?: 100
         versionName = "1.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
