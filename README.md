@@ -42,7 +42,7 @@ export ANDROID_HOME=/path/to/android-sdk          # or sdk.dir in local.properti
 
 ### Your own package name
 
-The default `applicationId` is `com.mbreeden.carlink`. Override per build or permanently:
+The default `applicationId` is `com.myequinox.myapp`. Override per build or permanently:
 
 ```bash
 ./gradlew assembleDebug -Pcarlink.applicationId=com.yourname.carlink

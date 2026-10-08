@@ -30,7 +30,7 @@ android {
         // Override with -Pcarlink.applicationId=... or in ~/.gradle/gradle.properties.
         // NOTE: Android stores the USB "always open with" default per package name, so changing
         // this after installing in the car means one more one-time permission prompt.
-        applicationId = providers.gradleProperty("carlink.applicationId").getOrElse("com.mbreeden.carlink")
+        applicationId = providers.gradleProperty("carlink.applicationId").getOrElse("com.myequinox.myapp")
         minSdk = 32
         targetSdk = 36
         versionCode = 62
