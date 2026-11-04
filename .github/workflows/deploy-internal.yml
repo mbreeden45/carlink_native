@@ -6,8 +6,9 @@ name: Deploy to Play internal
 # Required repository secrets:
 #   PLAY_STORE_JSON_KEY  service account JSON (github-actions-uploader@play-deploy-auto...), with
 #                        "Release to testing tracks" permission on the app in Play Console
-#   KEYSTORE_BASE64      base64 of the upload keystore (base64 -w0 upload.jks)
-#   KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+#   CARLINK_KEYSTORE_BASE64  base64 of the upload keystore (base64 -w0 upload.jks)
+#   CARLINK_STORE_PASSWORD, CARLINK_KEY_ALIAS, CARLINK_KEY_PASSWORD
+# (same keystore secrets release.yml uses)
 on:
   push:
     branches: [main]
@@ -42,13 +43,13 @@ jobs:
       - name: Check secrets are present
         env:
           PLAY_STORE_JSON_KEY: ${{ secrets.PLAY_STORE_JSON_KEY }}
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          CARLINK_KEYSTORE_BASE64: ${{ secrets.CARLINK_KEYSTORE_BASE64 }}
+          CARLINK_STORE_PASSWORD: ${{ secrets.CARLINK_STORE_PASSWORD }}
+          CARLINK_KEY_ALIAS: ${{ secrets.CARLINK_KEY_ALIAS }}
+          CARLINK_KEY_PASSWORD: ${{ secrets.CARLINK_KEY_PASSWORD }}
         run: |
           missing=0
-          for name in PLAY_STORE_JSON_KEY KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+          for name in PLAY_STORE_JSON_KEY CARLINK_KEYSTORE_BASE64 CARLINK_STORE_PASSWORD CARLINK_KEY_ALIAS CARLINK_KEY_PASSWORD; do
             if [ -z "${!name}" ]; then echo "::error::Secret $name is not set"; missing=1; fi
           done
           # Without a keystore Gradle silently builds an UNSIGNED bundle, which Play rejects.
@@ -64,8 +65,8 @@ jobs:
 
       - name: Decode keystore
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          CARLINK_KEYSTORE_BASE64: ${{ secrets.CARLINK_KEYSTORE_BASE64 }}
+        run: echo "$CARLINK_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
 
       - name: Unit tests
         run: ./gradlew --no-daemon testDebugUnitTest
@@ -74,9 +75,9 @@ jobs:
         env:
           # Names app/build.gradle.kts reads for release signing.
           CARLINK_STORE_FILE: ${{ runner.temp }}/upload.jks
-          CARLINK_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          CARLINK_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          CARLINK_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          CARLINK_STORE_PASSWORD: ${{ secrets.CARLINK_STORE_PASSWORD }}
+          CARLINK_KEY_ALIAS: ${{ secrets.CARLINK_KEY_ALIAS }}
+          CARLINK_KEY_PASSWORD: ${{ secrets.CARLINK_KEY_PASSWORD }}
         run: ./gradlew --no-daemon bundleRelease -Pcarlink.versionCode=${{ steps.version.outputs.code }}
 
       - name: Verify bundle is signed
