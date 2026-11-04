@@ -24,12 +24,16 @@
     <uses-permission android:name="android.car.permission.CAR_UX_RESTRICTIONS_CONFIGURATION"
         tools:ignore="ProtectedPermissions" />
 
-    <!-- USB Host Feature (required) -->
+    <!-- USB Host. required=false ON PURPOSE. The CPC200 needs USB host at runtime, but GM AAOS
+         (gm/gminfo37) does NOT advertise android.hardware.usb.host in its Play device profile.
+         With required=true, Google Play filters the Equinox out of the Internal Testing track and
+         the head unit never sees an update. required=false stops the filtering; UsbManager and the
+         <usb-device> filter below are unaffected and still work at runtime. -->
     <uses-feature
         android:name="android.hardware.usb.host"
-        android:required="true" />
+        android:required="false" />
 
-    <!-- Optional Features -->
+    <!-- This appliance is wireless CarPlay over a USB dongle; it is never a USB accessory. -->
     <uses-feature
         android:name="android.hardware.usb.accessory"
         android:required="false" />

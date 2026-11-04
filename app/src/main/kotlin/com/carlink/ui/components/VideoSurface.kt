@@ -2,7 +2,6 @@ package com.carlink.ui.components
 
 import android.view.MotionEvent
 import android.view.Surface
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -47,7 +46,9 @@ fun VideoSurface(
     }
 
     AndroidView(
-        modifier = modifier.fillMaxSize(),
+        // Caller controls sizing: MainScreen aspect-locks this to the decoded video size so an
+        // ultrawide panel letterboxes instead of stretching. Defaults to fillMaxSize (see call site).
+        modifier = modifier,
         factory = { context ->
             logInfo("[VIDEO_SURFACE] Creating VideoSurfaceView", tag = "UI")
             VideoSurfaceView(context).apply {

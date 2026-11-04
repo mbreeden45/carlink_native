@@ -7,6 +7,8 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.os.Process
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -60,6 +62,19 @@ object MicFormats {
             7 -> STEREO_VOICE
             else -> SIRI_VOICE // Default to 16kHz mono
         }
+
+    /** 16 kHz mono: Siri, CarPlay wideband call, and the safe fallback. */
+    const val DEFAULT_UPLINK_DECODE_TYPE = 5
+
+    /** decodeTypes that describe a VOICE stream (and therefore the uplink format the box expects). */
+    fun isVoiceDecodeType(decodeType: Int): Boolean = decodeType == 3 || decodeType == 5 || decodeType == 6 || decodeType == 7
+
+    /**
+     * Uplink format to actually capture for a requested [decodeType]. 24 kHz (6) and stereo (7) are
+     * dropped by the adapter's fixed 640 B input buffer, so they fall back to 16 kHz mono; 8 kHz (3)
+     * is honoured; anything else (media types 1/2/4, unknown) is never a mic format -> 16 kHz.
+     */
+    fun uplinkDecodeType(decodeType: Int): Int = if (decodeType == 3) 3 else DEFAULT_UPLINK_DECODE_TYPE
 }
 
 /**
@@ -105,12 +120,24 @@ class MicrophoneCaptureManager(
         /** How long each candidate source is listened to before judging it silent. */
         private const val PROBE_MS = 240
 
-        /** Candidate capture sources, in preference order. */
+        /**
+         * Candidate capture sources, in preference order — tuned for GM AAOS (gminfo37).
+         *
+         * GM's audio policy (documents/reference/gminfo/audio) routes VOICE_RECOGNITION to the
+         * Built-In Mic and VOICE_COMMUNICATION to `mic_for_vc`, the telephony voice-uplink bus.
+         * `mic_for_vc` delivers DIGITAL SILENCE unless a native telephony call is up, so a CarPlay
+         * Siri session / voice message / Snapchat (which open a generic record, not a call) that
+         * grabs VOICE_COMMUNICATION first records nothing. That was the "mic is dead everywhere
+         * except maybe calls" bug. VOICE_RECOGNITION (Built-In Mic) is therefore tried FIRST; it is
+         * also the source GM documents for voice input and it comes with the Harman AEC+NS effect
+         * chain. VOICE_COMMUNICATION is kept later in the list for the real-call case, and the
+         * runtime silence probe still moves on from any source that produces all-zero samples.
+         */
         private val SOURCES =
             intArrayOf(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                MediaRecorder.AudioSource.MIC,
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC,
+                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
                 MediaRecorder.AudioSource.CAMCORDER,
             )
 
@@ -137,6 +164,13 @@ class MicrophoneCaptureManager(
     private var currentFormat: MicFormatConfig? = null
     private var captureThread: MicCaptureThread? = null
     private val isRunning = AtomicBoolean(false)
+
+    // Voice-processing effects attached to the capture session. On GM the Built-In Mic exposes the
+    // Harman AEC/NS chain; enabling them kills the cabin echo the far end otherwise hears on Siri and
+    // calls, and AGC levels a quiet talker. All three are best-effort: absent on a given head unit,
+    // the fields stay null and raw capture is used.
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
 
     /** Source that last proved it delivers audio; skips probing on later starts. */
     @Volatile private var validatedSource: Int? = null
@@ -246,6 +280,8 @@ class MicrophoneCaptureManager(
                 return false
             }
 
+            enableVoiceEffects(chosen.audioSessionId)
+
             captureThread = MicCaptureThread(chosen, format, sink).also { it.start() }
 
             log("[MIC] Capture started: ${format.sampleRate}Hz ${format.channelCount}ch src=${sourceName(chosenSource)}")
@@ -271,6 +307,8 @@ class MicrophoneCaptureManager(
             } catch (_: InterruptedException) {
                 // Ignore
             }
+
+            releaseVoiceEffects()
 
             audioRecord?.let { release(it) }
             audioRecord = null
@@ -354,6 +392,45 @@ class MicrophoneCaptureManager(
             log("[MIC] probe failed: ${e.message}")
             false
         }
+    }
+
+    /**
+     * Best-effort attach AEC/NS to the capture [sessionId]. Silent no-op where unsupported.
+     *
+     * The handle is stored BEFORE setEnabled(): setEnabled() throws IllegalStateException on an
+     * effect the engine failed to initialise, and with `create()?.apply { enabled = true }` that throw
+     * skipped the assignment, so the native effect handle was never released (one leak per Siri
+     * session). AGC is deliberately not attached: the CDD requires VOICE_RECOGNITION capture to be free
+     * of AGC, and Siri / the far end apply their own gain; stacking a third AGC pumps cabin noise.
+     */
+    private fun enableVoiceEffects(sessionId: Int) {
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                val fx = AcousticEchoCanceler.create(sessionId)
+                echoCanceler = fx
+                val rc = fx?.setEnabled(true)
+                log("[MIC] AcousticEchoCanceler ${if (fx?.enabled == true) "enabled" else "unavailable (rc=$rc)"}")
+            }
+        } catch (e: Exception) {
+            log("[MIC] AEC attach failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                val fx = NoiseSuppressor.create(sessionId)
+                noiseSuppressor = fx
+                val rc = fx?.setEnabled(true)
+                log("[MIC] NoiseSuppressor ${if (fx?.enabled == true) "enabled" else "unavailable (rc=$rc)"}")
+            }
+        } catch (e: Exception) {
+            log("[MIC] NS attach failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun releaseVoiceEffects() {
+        runCatching { echoCanceler?.release() }
+        runCatching { noiseSuppressor?.release() }
+        echoCanceler = null
+        noiseSuppressor = null
     }
 
     private fun release(record: AudioRecord) {

@@ -239,29 +239,29 @@ object MessageSerializer {
     ): ByteArray {
         val actualSyncTime = syncTime ?: (System.currentTimeMillis() / 1000)
 
-        // Android Auto Resolution Selection Algorithm
-        // AA supports only 3 resolutions: 800x480, 1280x720, 1920x1080
-        val (aaWidth, aaHeight) =
-            when {
-                config.width >= 1920 && config.height >= 1080 -> Pair(1920, 1080)
-                config.width >= 1280 && config.height >= 720 -> Pair(1280, 720)
-                else -> Pair(800, 480)
-            }
-
+        // Single-user wireless-CarPlay appliance: this box never hosts Android Auto, so the AA
+        // resolution-selection algorithm is gone. The firmware still expects the two keys to exist,
+        // so we send a fixed, valid pair; it is never exercised because AndroidWorkMode is disabled.
         val json =
             JSONObject().apply {
                 put("mediaDelay", config.mediaDelay)
                 put("syncTime", actualSyncTime)
-                put("androidAutoSizeW", aaWidth)
-                put("androidAutoSizeH", aaHeight)
+                put("androidAutoSizeW", 1920)
+                put("androidAutoSizeH", 1080)
                 put("mediaSound", if (config.sampleRate == 44100) 0 else 1) // 0=44.1kHz, 1=48kHz
-                put("callQuality", config.callQuality) // 0=normal, 1=clear, 2=HD
+                // Clamp call quality to <= 1. Value 2 (24 kHz) soft-bricks mic input: the adapter's
+                // AirPlay audio-input buffer is hardcoded to 640 B (16 kHz x 20 ms x 2 B), so 24 kHz
+                // mic frames (960 B) are dropped and calls/Siri go silent.
+                put("callQuality", config.callQuality.coerceAtMost(1))
                 put("WiFiChannel", 161) // 5GHz channel 161 (optimal low interference)
                 put("wifiChannel", 161) // Both keys for compatibility
-                put("wifiName", "carlink")
-                put("btName", "carlink")
-                put("boxName", "carlink")
-                put("OemName", "carlink")
+                // Connect the one known iPhone the instant it is in range; never auto-play on link.
+                put("autoConn", true)
+                put("autoPlay", false)
+                put("wifiName", config.boxName)
+                put("btName", config.boxName)
+                put("boxName", config.boxName)
+                put("OemName", config.boxName)
             }
 
         val payload = json.toString().toByteArray(StandardCharsets.US_ASCII)
@@ -315,6 +315,10 @@ oemIconLabel = ${config.boxName}
         // - Open: display dimensions may change between sessions
         messages.add(serializeNumber(config.dpi, FileAddress.DPI))
         messages.add(serializeOpen(config))
+        // Tell the box to auto-reconnect the last paired phone the moment it is in range, every
+        // session. Cheap, idempotent, and the single biggest "locks in immediately" win for a
+        // one-phone appliance.
+        messages.add(serializeCommand(CommandMapping.AUTO_CONNECT_ENABLE))
 
         when (initMode) {
             "MINIMAL_ONLY" -> {
@@ -346,7 +350,7 @@ oemIconLabel = ${config.boxName}
     }
 
     /**
-     * Re-assert microphone source and audio transfer mode on every session.
+     * Re-assert microphone source, audio transfer mode, and CarPlay-only work mode on every session.
      *
      * The adapter persists these across power cycles, so after the first full init they were never
      * sent again. If the adapter ever drifts (firmware reset, another app, an old "box mic" or
@@ -370,6 +374,10 @@ oemIconLabel = ${config.boxName}
                 ),
             )
         }
+        // Previously FULL-only, i.e. written once on first install and never again. Every session
+        // makes the CarPlay-only choice authoritative whether or not the box persists it (the forks
+        // this came from re-sent it on every connection). One 4-byte SEND_FILE.
+        messages.add(serializeBoolean(false, FileAddress.ANDROID_WORK_MODE))
     }
 
     /**
@@ -458,8 +466,11 @@ oemIconLabel = ${config.boxName}
         val audioTransferCommand = if (config.audioTransferMode) CommandMapping.AUDIO_TRANSFER_ON else CommandMapping.AUDIO_TRANSFER_OFF
         messages.add(serializeCommand(audioTransferCommand))
 
-        // ALWAYS enable AndroidWorkMode
-        messages.add(serializeBoolean(true, FileAddress.ANDROID_WORK_MODE))
+        // CarPlay-only appliance: keep the box out of Android Auto negotiation. (Was unconditionally
+        // `true` in the forks this started from.) NOTE: this is AndroidWorkMode, a DIFFERENT firmware
+        // parameter from UdiskMode (documents/reference/Firmware/firmware_configurables.md). It does
+        // not change the U-disk setting the web-config shortcut toggles.
+        messages.add(serializeBoolean(false, FileAddress.ANDROID_WORK_MODE))
     }
 
     /**

@@ -92,4 +92,20 @@ class FocusCooldownTest {
         c.clear()
         assertFalse(c.isSuppressed())
     }
+
+    @Test
+    fun onlyVoiceFramesDescribeTheUplinkFormat() {
+        // Media / nav playback (44.1/48 kHz stereo) must never steer mic capture.
+        listOf(1, 2, 4, 0, 99).forEach { assertFalse("decodeType $it is not voice", MicFormats.isVoiceDecodeType(it)) }
+        listOf(3, 5, 6, 7).forEach { assertTrue("decodeType $it is voice", MicFormats.isVoiceDecodeType(it)) }
+    }
+
+    @Test
+    fun uplinkFormatIsClampedToWhatTheAdapterAccepts() {
+        assertEquals(3, MicFormats.uplinkDecodeType(3)) // 8 kHz narrowband honoured
+        assertEquals(5, MicFormats.uplinkDecodeType(5))
+        assertEquals(5, MicFormats.uplinkDecodeType(6)) // 24 kHz overflows the 640 B buffer
+        assertEquals(5, MicFormats.uplinkDecodeType(7)) // stereo likewise
+        assertEquals(5, MicFormats.uplinkDecodeType(4)) // a media type is never a mic format
+    }
 }
