@@ -6,6 +6,7 @@ import android.os.PowerManager
 import android.view.Surface
 import com.carlink.audio.AudioFocusController
 import com.carlink.audio.DualStreamAudioManager
+import com.carlink.audio.MicFormats
 import com.carlink.audio.MicrophoneCaptureManager
 import com.carlink.connection.ConnectResult
 import com.carlink.connection.ConnectionHooks
@@ -172,7 +173,7 @@ class CarlinkManager(
 
     // USB
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-    private var usbDevice: UsbDeviceWrapper? = null
+    @Volatile private var usbDevice: UsbDeviceWrapper? = null
 
     // Wake lock to prevent CPU sleep during USB streaming
     // PARTIAL_WAKE_LOCK keeps CPU running but allows screen to turn off
@@ -209,13 +210,23 @@ class CarlinkManager(
     // (decodeType 5), Siri/voice 16 kHz, AA narrowband calls 8 kHz (decodeType 3). We capture mic at
     // whatever the box last asked for instead of assuming 16 kHz, then clamp: 24 kHz / stereo
     // (6/7) are dropped by the adapter's fixed 640 B input buffer, so they fall back to 16 kHz.
-    @Volatile private var lastInputDecodeType = 5
+    // Only VOICE-format frames (3/5/6/7) update this. Media and nav playback frames (decodeType
+    // 1/2/4: 44.1/48 kHz stereo) arrive far more often and say nothing about the uplink format;
+    // letting them overwrite it meant a narrowband call's "8 kHz" was lost the instant a nav prompt
+    // played. Reset on every teardown so one session's format never leaks into the next.
+    @Volatile private var lastInputDecodeType = MicFormats.DEFAULT_UPLINK_DECODE_TYPE
 
-    private fun clampMicDecodeType(decodeType: Int): Int =
-        when (decodeType) {
-            3 -> 3 // 8 kHz mono (AA / narrowband call)
-            else -> 5 // 16 kHz mono (Siri, CarPlay call, and safe fallback for 6/7)
-        }
+    private fun clampMicDecodeType(decodeType: Int): Int = MicFormats.uplinkDecodeType(decodeType)
+
+    // Last decoded video size (crop-corrected), replayed to every newly bound UI callback so a
+    // re-created screen / callback never sits at "aspect unknown" (stretched) waiting for a format
+    // change that the renderer will not report again (it de-duplicates by size).
+    @Volatile private var lastVideoWidth = 0
+
+    @Volatile private var lastVideoHeight = 0
+
+    // Single in-flight USB attach debounce (see onUsbDeviceAttached).
+    private var attachJob: Job? = null
 
     // MediaSession
     private var mediaSessionManager: MediaSessionManager? = null
@@ -392,8 +403,12 @@ class CarlinkManager(
             if (now - lastSurfaceRebindMs >= 120L) {
                 lastSurfaceRebindMs = now
                 h264Renderer?.setOutputSurface(surface)
-                h264Renderer?.resume()
             }
+            // NOT throttled: resume() is a no-op unless the codec is actually flushed/paused, and it
+            // must never be skipped -- a throttled-away resume() after pause() left the codec flushed
+            // with videoPaused=false: frames queued, no input callbacks, permanent black screen.
+            h264Renderer?.resume()
+            replayVideoSize()
             return
         }
         
@@ -443,10 +458,14 @@ class CarlinkManager(
         }
 
         // Forward the decoded video size so the UI can aspect-lock the surface (ultrawide letterbox
-        // instead of stretch). Reads the current callback each time, so it survives surface rebinds.
+        // instead of stretch). The size is cached and replayed on every surface rebind.
+        // NOTE: must read the FIELD (this@CarlinkManager.callback). The bare name `callback` here is
+        // initialize()'s parameter, which would pin the first screen's callback forever.
         h264Renderer?.setVideoSizeListener { w, h ->
             logInfo("[RES] Decoded video size reported: ${w}x$h", tag = Logger.Tags.VIDEO)
-            callback?.onVideoSizeChanged(w, h)
+            lastVideoWidth = w
+            lastVideoHeight = h
+            replayVideoSize()
         }
 
         // Start the H264 renderer to initialize MediaCodec and begin decoding
@@ -540,6 +559,17 @@ class CarlinkManager(
     }
 
     /**
+     * Deliver the last known decoded size to the current UI callback on the main thread. Compose
+     * state must not be written from the MediaCodec callback thread while it holds codecLock.
+     */
+    private fun replayVideoSize() {
+        val w = lastVideoWidth
+        val h = lastVideoHeight
+        if (w <= 0 || h <= 0) return
+        scope.launch { this@CarlinkManager.callback?.onVideoSizeChanged(w, h) }
+    }
+
+    /**
      * Ask for a connection to the adapter. Returns immediately; the connection runs in a
      * manager-owned scope, retries on failure, and is a no-op if a session is already healthy.
      */
@@ -572,17 +602,39 @@ class CarlinkManager(
      * USB attach event from the system (delivered to the Activity via its intent filter).
      * Connects unless we already hold a working session on that exact device.
      */
+    // Main thread only (Activity onCreate/onNewIntent). Deliberately NOT @Synchronized: that monitor
+    // is shared with start/stopMicrophoneCapture, which can block ~1 s joining the capture thread.
     fun onUsbDeviceAttached(deviceName: String?) {
         logInfo("[USB] Attach event for $deviceName", tag = Logger.Tags.USB)
-        val current = usbDevice
-        if (state != State.DISCONNECTED && current != null && current.deviceName == deviceName) {
-            logInfo("[USB] Attach event for the device we already hold - ignoring", tag = Logger.Tags.USB)
-            return
-        }
-        connectionScope.launch {
-            delay(ATTACH_SETTLE_MS)
-            supervisor.connect("usb-attach", skipIfHealthy = false)
-        }
+        // Debounce: a fast replug / re-enumeration can deliver several attach intents inside the
+        // settle window. Keep only the latest, so two delayed skipIfHealthy=false connects can never
+        // fire back-to-back and tear down the session the first one just brought up.
+        attachJob?.cancel()
+        attachJob =
+            connectionScope.launch {
+                delay(ATTACH_SETTLE_MS)
+                // Evaluate AFTER the settle delay: the in-flight attempt may have opened this device
+                // in the meantime.
+                val current = usbDevice
+                if (state != State.DISCONNECTED && current != null && current.isOpened && current.deviceName == deviceName) {
+                    logInfo("[USB] Attach event for the device we already hold open - ignoring", tag = Logger.Tags.USB)
+                    return@launch
+                }
+                if (supervisor.isAttemptActive && current != null && !current.isOpened && current.deviceName != deviceName) {
+                    // The running attempt is bound to a STALE device instance (pre-replug path) and is
+                    // waiting on a grant that can never arrive for it. connect() would coalesce into it,
+                    // so preempt it instead.
+                    logWarn(
+                        "[USB] Running attempt holds stale ${current.deviceName}; restarting for $deviceName",
+                        tag = Logger.Tags.USB,
+                    )
+                    supervisor.restart("usb-attach-stale")
+                    return@launch
+                }
+                // Same path but not yet open (attempt waiting on permission): connect() coalesces and
+                // the attempt's own hasPermission() poll picks the attach-launch grant up.
+                supervisor.connect("usb-attach", skipIfHealthy = false)
+            }
     }
 
     /**
@@ -634,7 +686,12 @@ class CarlinkManager(
         usbDevice = device
 
         if (!device.openWithPermission()) {
-            logError("Failed to open USB device", tag = Logger.Tags.USB)
+            logError(
+                "Failed to open USB device (denied=${device.permissionDenied}, detached=${device.detached})",
+                tag = Logger.Tags.USB,
+            )
+            // A device that vanished mid-wait is a re-enumeration, not a refusal: FAILED (short
+            // backoff), never PERMISSION_DENIED (60 s backoff).
             return if (device.permissionDenied) ConnectResult.PERMISSION_DENIED else ConnectResult.FAILED
         }
 
@@ -733,6 +790,7 @@ class CarlinkManager(
             currentPhoneType = null // Clear phone type on disconnect
             clearCachedMediaMetadata() // Clear stale metadata to prevent race conditions on reconnect
             stopMicrophoneCapture()
+            lastInputDecodeType = MicFormats.DEFAULT_UPLINK_DECODE_TYPE
 
             adapterDriver?.stop()
             adapterDriver = null
@@ -1209,7 +1267,7 @@ class CarlinkManager(
 
         // Track the adapter's requested mic PCM format from every audio frame it sends, so a later
         // START_RECORD_AUDIO / Siri / call captures at the format the box actually expects.
-        if (message is AudioDataMessage) {
+        if (message is AudioDataMessage && MicFormats.isVoiceDecodeType(message.decodeType)) {
             lastInputDecodeType = message.decodeType
         }
 

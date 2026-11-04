@@ -99,6 +99,11 @@ class VideoSurfaceView
         var isSurfaceCreated: Boolean = false
             private set
 
+        // True from surfaceCreated() until the first surfaceChanged() has been reported as a creation.
+        // Previously isSurfaceCreated (which stays true for the surface's whole life) was used, so every
+        // later resize -- e.g. the aspect-lock letterbox resize -- was re-announced as a NEW surface.
+        private var creationPending: Boolean = false
+
         init {
             // Register for surface callbacks
             holder.addCallback(this)
@@ -136,6 +141,7 @@ class VideoSurfaceView
 
         override fun surfaceCreated(holder: SurfaceHolder) {
             isSurfaceCreated = true
+            creationPending = true
             logInfo("[VIDEO_SURFACE_VIEW] Surface created", tag = "UI")
             logVideoSurface { "SurfaceHolder created, awaiting dimensions" }
 
@@ -157,7 +163,8 @@ class VideoSurfaceView
 
             // If this is the first surfaceChanged after surfaceCreated, treat as creation
             // Otherwise treat as a resize
-            if (isSurfaceCreated) {
+            if (creationPending) {
+                creationPending = false
                 callback?.onSurfaceCreated(holder.surface, width, height)
             } else {
                 callback?.onSurfaceChanged(width, height)
@@ -169,6 +176,7 @@ class VideoSurfaceView
             logVideoSurface { "surfaceDestroyed: was ${surfaceWidth}x$surfaceHeight" }
 
             isSurfaceCreated = false
+            creationPending = false
             surfaceWidth = 0
             surfaceHeight = 0
 

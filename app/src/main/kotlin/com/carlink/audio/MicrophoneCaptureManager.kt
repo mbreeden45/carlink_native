@@ -8,7 +8,6 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Process
 import android.util.Log
@@ -63,6 +62,19 @@ object MicFormats {
             7 -> STEREO_VOICE
             else -> SIRI_VOICE // Default to 16kHz mono
         }
+
+    /** 16 kHz mono: Siri, CarPlay wideband call, and the safe fallback. */
+    const val DEFAULT_UPLINK_DECODE_TYPE = 5
+
+    /** decodeTypes that describe a VOICE stream (and therefore the uplink format the box expects). */
+    fun isVoiceDecodeType(decodeType: Int): Boolean = decodeType == 3 || decodeType == 5 || decodeType == 6 || decodeType == 7
+
+    /**
+     * Uplink format to actually capture for a requested [decodeType]. 24 kHz (6) and stereo (7) are
+     * dropped by the adapter's fixed 640 B input buffer, so they fall back to 16 kHz mono; 8 kHz (3)
+     * is honoured; anything else (media types 1/2/4, unknown) is never a mic format -> 16 kHz.
+     */
+    fun uplinkDecodeType(decodeType: Int): Int = if (decodeType == 3) 3 else DEFAULT_UPLINK_DECODE_TYPE
 }
 
 /**
@@ -159,7 +171,6 @@ class MicrophoneCaptureManager(
     // the fields stay null and raw capture is used.
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
-    private var gainControl: AutomaticGainControl? = null
 
     /** Source that last proved it delivers audio; skips probing on later starts. */
     @Volatile private var validatedSource: Int? = null
@@ -383,41 +394,43 @@ class MicrophoneCaptureManager(
         }
     }
 
-    /** Best-effort attach AEC/NS/AGC to the capture [sessionId]. Silent no-op where unsupported. */
+    /**
+     * Best-effort attach AEC/NS to the capture [sessionId]. Silent no-op where unsupported.
+     *
+     * The handle is stored BEFORE setEnabled(): setEnabled() throws IllegalStateException on an
+     * effect the engine failed to initialise, and with `create()?.apply { enabled = true }` that throw
+     * skipped the assignment, so the native effect handle was never released (one leak per Siri
+     * session). AGC is deliberately not attached: the CDD requires VOICE_RECOGNITION capture to be free
+     * of AGC, and Siri / the far end apply their own gain; stacking a third AGC pumps cabin noise.
+     */
     private fun enableVoiceEffects(sessionId: Int) {
         try {
             if (AcousticEchoCanceler.isAvailable()) {
-                echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
-                log("[MIC] AcousticEchoCanceler ${if (echoCanceler?.enabled == true) "enabled" else "unavailable"}")
+                val fx = AcousticEchoCanceler.create(sessionId)
+                echoCanceler = fx
+                val rc = fx?.setEnabled(true)
+                log("[MIC] AcousticEchoCanceler ${if (fx?.enabled == true) "enabled" else "unavailable (rc=$rc)"}")
             }
         } catch (e: Exception) {
-            log("[MIC] AEC attach failed: ${e.message}")
+            log("[MIC] AEC attach failed: ${e.javaClass.simpleName}: ${e.message}")
         }
         try {
             if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true }
-                log("[MIC] NoiseSuppressor ${if (noiseSuppressor?.enabled == true) "enabled" else "unavailable"}")
+                val fx = NoiseSuppressor.create(sessionId)
+                noiseSuppressor = fx
+                val rc = fx?.setEnabled(true)
+                log("[MIC] NoiseSuppressor ${if (fx?.enabled == true) "enabled" else "unavailable (rc=$rc)"}")
             }
         } catch (e: Exception) {
-            log("[MIC] NS attach failed: ${e.message}")
-        }
-        try {
-            if (AutomaticGainControl.isAvailable()) {
-                gainControl = AutomaticGainControl.create(sessionId)?.apply { enabled = true }
-                log("[MIC] AutomaticGainControl ${if (gainControl?.enabled == true) "enabled" else "unavailable"}")
-            }
-        } catch (e: Exception) {
-            log("[MIC] AGC attach failed: ${e.message}")
+            log("[MIC] NS attach failed: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
     private fun releaseVoiceEffects() {
         runCatching { echoCanceler?.release() }
         runCatching { noiseSuppressor?.release() }
-        runCatching { gainControl?.release() }
         echoCanceler = null
         noiseSuppressor = null
-        gainControl = null
     }
 
     private fun release(record: AudioRecord) {

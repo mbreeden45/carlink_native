@@ -95,6 +95,11 @@ public class H264Renderer {
     }
 
     private volatile VideoSizeListener videoSizeListener;
+
+    // True between pause() (codec flushed) and the resume() that restarts it. Guarded by codecLock.
+    // Makes resume() idempotent: start() on an already-Executing codec throws IllegalStateException,
+    // and callers (surface rebind on every layout change) no longer need to know the codec state.
+    private boolean paused = false;
     private int reportedVideoWidth = 0;
     private int reportedVideoHeight = 0;
 
@@ -335,9 +340,11 @@ public class H264Renderer {
             synchronized (codecLock) {
                 initCodec(width, height, surface);
                 mCodec.start();
+                paused = false;
                 // Scale the decoded buffer to the Surface bounds. The UI keeps the Surface itself at
-                // the decoded aspect ratio (see VideoSizeListener -> VideoSurfaceView.setVideoAspect),
-                // so SCALE_TO_FIT here fills that AR-correct rect exactly with no stretching.
+                // the decoded aspect ratio (VideoSizeListener -> CarlinkManager -> MainScreen
+                // aspectRatio()), so SCALE_TO_FIT fills that AR-correct rect with no stretching.
+                // SCALE_TO_FIT is also the platform default; this call is belt-and-braces only.
                 try {
                     mCodec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
                 } catch (Exception scaleEx) {
@@ -428,7 +435,9 @@ public class H264Renderer {
                     mCodec.release();
                     mCodec = null;
                 }
+                paused = false;
             } catch (Exception e) {
+                paused = false;
                 log("STOP: MediaCodec cleanup failed - " + e.toString());
                 mCodec = null; // Force null to prevent further issues
             } finally {
@@ -556,6 +565,7 @@ public class H264Renderer {
                 try {
                     mCodec.flush();
                     mCodec.start();  // REQUIRED in async mode after flush!
+                    paused = false;
                     codecStartTime = System.currentTimeMillis();  // Reset stabilization timer
                     log("[RESET] Codec flush+start completed - callbacks should resume");
                     VideoDebugLogger.logCodecStarted();
@@ -574,6 +584,7 @@ public class H264Renderer {
                     try {
                         initCodec(width, height, surface);
                         mCodec.start();
+                        paused = false;
                         codecStartTime = System.currentTimeMillis();
                         log("[RESET] Fallback codec recreation completed");
                         VideoDebugLogger.logCodecStarted();
@@ -686,6 +697,7 @@ public class H264Renderer {
                 // Clear ring buffer - stale data should not be decoded on resume
                 ringBuffer.reset();
 
+                paused = true;
                 log("[LIFECYCLE] Codec paused - buffers flushed, ready for background");
             } catch (Exception e) {
                 log("[LIFECYCLE] pause() failed: " + e.toString());
@@ -716,9 +728,17 @@ public class H264Renderer {
                 return;
             }
 
+            if (!paused) {
+                // Already Executing (e.g. a layout-driven surface rebind): nothing to restart, and
+                // no keyframe needed - setOutputSurface() keeps the decoder's reference state.
+                log("[LIFECYCLE] resume(): codec not paused - no-op");
+                return;
+            }
+
             try {
                 // Restart codec after flush (required in async mode)
                 mCodec.start();
+                paused = false;
                 codecStartTime = System.currentTimeMillis();
 
                 // Reset keyframe detection - we need a new IDR frame

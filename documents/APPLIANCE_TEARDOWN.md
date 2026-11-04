@@ -147,3 +147,31 @@ Unchanged from the prior note: none of this has run on a vehicle yet. On the fir
 implicit grant, not a dialog), and `[RES]` (should read `2400x960`, `gmNative=true`). The
 **Audio Focus** toggle and the **Microphone Source = App** setting remain the two levers if audio or
 mic misbehave.
+
+---
+
+## 5. Review follow-ups (polish pass on top of this branch)
+
+Corrections to claims above, and the fixes that landed with them:
+
+- **`android_work_mode` is not the U-disk switch.** `firmware_configurables.md` lists `AndroidWorkMode`
+  and `UdiskMode` as separate parameters; the web-config shortcut toggles the U-disk one, which no
+  host USB message here touches. Writing `android_work_mode=false` turns off Android Auto
+  negotiation. Whether that alone cures the cold-boot stall is **unverified**. Keep the shortcut until
+  a cold boot without it shows `[USB] Interface 0: class=0xff ...` followed by protocol traffic.
+- **No USB command can reach a box that hasn't exposed its protocol interface.** If it boots presenting
+  only a storage personality, `findDevice()` never matches (or now logs and skips the class-0x08
+  interface instead of claiming it), so nothing in the init sequence is ever sent.
+- **Boot settings never reached already-initialised installs.** BoxSettings (`autoConn`, `autoPlay`,
+  `callQuality` clamp, `boxName`) and `android_work_mode` were FULL-only, and an upgraded install runs
+  MINIMAL_ONLY forever. Fixed: `CURRENT_INIT_REVISION` forces one FULL init after upgrade, and
+  `android_work_mode=false` is now re-sent every session.
+- **USB permission.** The dialog wait now also completes when the grant arrives out-of-band (the
+  attach launch) or when the device instance disappears, instead of holding the supervisor mutex for
+  up to 5 min. Attach intents are debounced, and an attempt bound to a stale device path is preempted.
+- **Mic.** Only voice-format frames (3/5/6/7) steer the uplink `decodeType`; it resets per session. An
+  effect handle no longer leaks when `setEnabled()` throws. AGC was dropped (VOICE_RECOGNITION path).
+- **Video.** `resume()` is idempotent (`paused` flag), so a surface rebind can't call `start()` on an
+  Executing codec, and is never throttled away after a `pause()`. The decoded size is cached and
+  replayed to the current callback on the main thread. Resizes are no longer re-announced as new
+  surfaces, and OPEN uses the panel size rather than the letterboxed surface size.

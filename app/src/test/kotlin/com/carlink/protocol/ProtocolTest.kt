@@ -153,11 +153,32 @@ class ProtocolTest {
     @Test
     fun fullInitKeepsBoxOutOfAndroidAuto() {
         // CarPlay-only appliance: android_work_mode must be written false (0) so the box does not
-        // burn startup time negotiating Android Auto / U-disk mode.
+        // burn startup time negotiating Android Auto. (Separate firmware parameter from UdiskMode.)
         val content = sendFileContentInt(MessageSerializer.generateInitSequence(AdapterConfig(), "FULL"), FileAddress.ANDROID_WORK_MODE.path)
         assertNotNull("android_work_mode must be written during FULL init", content)
         assertEquals("android_work_mode must be disabled", 0, content)
     }
+
+    @Test
+    fun androidWorkModeIsDisabledExactlyOnceInEverySession() {
+        // Was FULL-only: an install that had already completed first init never re-sent it.
+        for (mode in listOf("MINIMAL_ONLY", "MINIMAL_PLUS_CHANGES", "FULL")) {
+            val msgs = MessageSerializer.generateInitSequence(AdapterConfig(), mode, setOf(MessageSerializer.ConfigKey.MIC_SOURCE))
+            assertEquals("android_work_mode must be 0 in $mode", 0, sendFileContentInt(msgs, FileAddress.ANDROID_WORK_MODE.path))
+            assertEquals("android_work_mode written once in $mode", 1, sendFileCount(msgs, FileAddress.ANDROID_WORK_MODE.path))
+        }
+    }
+
+    private fun sendFileCount(
+        messages: List<ByteArray>,
+        path: String,
+    ): Int =
+        messages.count { m ->
+            if (header(m).type != MessageType.SEND_FILE) return@count false
+            val p = payload(m)
+            val nameLen = ByteBuffer.wrap(p).order(ByteOrder.LITTLE_ENDIAN).int
+            String(p, 4, nameLen, Charsets.US_ASCII).trimEnd('\u0000') == path
+        }
 
     @Test
     fun boxSettingsEnablesAutoConnectAndClampsCallQuality() {

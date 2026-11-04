@@ -216,6 +216,15 @@ class AdapterConfigPreference private constructor(
         private const val SYNC_CACHE_KEY_WIFI_BAND = "wifi_band"
         private const val SYNC_CACHE_KEY_CALL_QUALITY = "call_quality"
         private const val SYNC_CACHE_KEY_HAS_COMPLETED_FIRST_INIT = "has_completed_first_init"
+        private const val SYNC_CACHE_KEY_INIT_REVISION = "init_revision"
+
+        /**
+         * Bump whenever the FULL init payload gains settings an already-initialised adapter must
+         * receive. An install whose stored revision is older gets exactly one FULL init on its next
+         * connect. Without this, an upgraded install stays on MINIMAL_ONLY forever and new BoxSettings
+         * keys (2 = appliance pass: autoConn/autoPlay, callQuality clamp, boxName) never reach the box.
+         */
+        const val CURRENT_INIT_REVISION = 2
         private const val SYNC_CACHE_KEY_PENDING_CHANGES = "pending_changes"
 
         /**
@@ -606,6 +615,9 @@ class AdapterConfigPreference private constructor(
      */
     fun hasCompletedFirstInitSync(): Boolean = syncCache.getBoolean(SYNC_CACHE_KEY_HAS_COMPLETED_FIRST_INIT, false)
 
+    /** Revision of the FULL init payload this install last delivered to the adapter (0 = pre-revisioning). */
+    fun initRevisionSync(): Int = syncCache.getInt(SYNC_CACHE_KEY_INIT_REVISION, 0)
+
     /**
      * Mark first initialization as completed.
      */
@@ -614,7 +626,11 @@ class AdapterConfigPreference private constructor(
             dataStore.edit { preferences ->
                 preferences[KEY_HAS_COMPLETED_FIRST_INIT] = true
             }
-            syncCache.edit().putBoolean(SYNC_CACHE_KEY_HAS_COMPLETED_FIRST_INIT, true).apply()
+            syncCache
+                .edit()
+                .putBoolean(SYNC_CACHE_KEY_HAS_COMPLETED_FIRST_INIT, true)
+                .putInt(SYNC_CACHE_KEY_INIT_REVISION, CURRENT_INIT_REVISION)
+                .apply()
             logInfo("First initialization marked as completed", tag = "AdapterConfig")
         } catch (e: Exception) {
             logError("Failed to mark first init completed: $e", tag = "AdapterConfig")
@@ -671,6 +687,7 @@ class AdapterConfigPreference private constructor(
 
         return when {
             !hasCompletedFirstInit -> InitMode.FULL
+            initRevisionSync() < CURRENT_INIT_REVISION -> InitMode.FULL
             pendingChanges.isNotEmpty() -> InitMode.MINIMAL_PLUS_CHANGES
             else -> InitMode.MINIMAL_ONLY
         }
@@ -683,7 +700,12 @@ class AdapterConfigPreference private constructor(
         val mode = getInitializationMode()
         val pendingChanges = getPendingChangesSync()
         return when (mode) {
-            InitMode.FULL -> "FULL (first launch)"
+            InitMode.FULL ->
+                if (hasCompletedFirstInitSync()) {
+                    "FULL (init revision ${initRevisionSync()} -> $CURRENT_INIT_REVISION)"
+                } else {
+                    "FULL (first launch)"
+                }
             InitMode.MINIMAL_PLUS_CHANGES -> "MINIMAL + changes: $pendingChanges"
             InitMode.MINIMAL_ONLY -> "MINIMAL (no changes)"
         }

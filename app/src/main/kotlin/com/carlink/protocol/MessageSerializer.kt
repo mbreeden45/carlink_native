@@ -350,7 +350,7 @@ oemIconLabel = ${config.boxName}
     }
 
     /**
-     * Re-assert microphone source and audio transfer mode on every session.
+     * Re-assert microphone source, audio transfer mode, and CarPlay-only work mode on every session.
      *
      * The adapter persists these across power cycles, so after the first full init they were never
      * sent again. If the adapter ever drifts (firmware reset, another app, an old "box mic" or
@@ -374,6 +374,10 @@ oemIconLabel = ${config.boxName}
                 ),
             )
         }
+        // Previously FULL-only, i.e. written once on first install and never again. Every session
+        // makes the CarPlay-only choice authoritative whether or not the box persists it (the forks
+        // this came from re-sent it on every connection). One 4-byte SEND_FILE.
+        messages.add(serializeBoolean(false, FileAddress.ANDROID_WORK_MODE))
     }
 
     /**
@@ -462,10 +466,10 @@ oemIconLabel = ${config.boxName}
         val audioTransferCommand = if (config.audioTransferMode) CommandMapping.AUDIO_TRANSFER_ON else CommandMapping.AUDIO_TRANSFER_OFF
         messages.add(serializeCommand(audioTransferCommand))
 
-        // CarPlay-only appliance: keep the box OUT of Android Auto / U-disk mode. With AndroidWorkMode
-        // enabled the firmware spends the first seconds of every session offering an AA/U-disk
-        // handshake (the "stuck in U-disk mode" delay). Disabling it makes the box commit to wireless
-        // CarPlay immediately. (Was unconditionally `true` in the forks this started from.)
+        // CarPlay-only appliance: keep the box out of Android Auto negotiation. (Was unconditionally
+        // `true` in the forks this started from.) NOTE: this is AndroidWorkMode, a DIFFERENT firmware
+        // parameter from UdiskMode (documents/reference/Firmware/firmware_configurables.md). It does
+        // not change the U-disk setting the web-config shortcut toggles.
         messages.add(serializeBoolean(false, FileAddress.ANDROID_WORK_MODE))
     }
 
