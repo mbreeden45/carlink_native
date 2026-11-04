@@ -10,8 +10,10 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import com.carlink.protocol.KnownDevices
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
@@ -193,11 +195,39 @@ class UsbDeviceWrapper(
      */
     suspend fun openWithPermission(): Boolean {
         if (!hasPermission()) {
-            if (!requestPermission()) {
-                return false
+            // Appliance path: when the adapter powers up with the USB bus and the user has ticked
+            // "Always open Carlink for this device", Android relaunches us through the
+            // USB_DEVICE_ATTACHED intent and grants access for this connection WITHOUT any dialog.
+            // That grant can land a beat AFTER the device enumerates, so a connect attempt that
+            // peeks at hasPermission() too early would needlessly pop the system dialog on an
+            // otherwise silent cold boot. Wait out a short grace window for the implicit grant
+            // first; only prompt if it never arrives (first install, or GM cleared the default).
+            if (!awaitImplicitGrant(IMPLICIT_GRANT_GRACE_MS)) {
+                log("No implicit USB grant after ${IMPLICIT_GRANT_GRACE_MS}ms - falling back to permission dialog")
+                if (!requestPermission()) {
+                    return false
+                }
             }
         }
         return open()
+    }
+
+    /**
+     * Poll [UsbManager.hasPermission] for up to [graceMs], returning true the moment the implicit
+     * "Always" grant from the attach-launch is visible. Keeps the appliance dialog-free on every
+     * normal trip without a race against enumeration order.
+     */
+    private suspend fun awaitImplicitGrant(graceMs: Long): Boolean {
+        val deadline = SystemClock.uptimeMillis() + graceMs
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (usbManager.hasPermission(device)) {
+                log("USB permission already held (granted by attach launch) - no dialog needed")
+                permissionDenied = false
+                return true
+            }
+            delay(IMPLICIT_GRANT_POLL_MS)
+        }
+        return false
     }
 
     /**
@@ -560,6 +590,15 @@ class UsbDeviceWrapper(
          * work. (A short timeout used to discard a late "Allow" and then re-prompt.)
          */
         private const val PERMISSION_TIMEOUT_MS = 5 * 60_000L
+
+        /**
+         * How long [openWithPermission] waits for the implicit "Always" grant (from being launched
+         * by the USB attach intent) before it shows a dialog. 2 s is comfortably longer than the
+         * observed grant-after-enumeration gap on gminfo37, and short enough that a genuine
+         * first-install still reaches the dialog quickly.
+         */
+        private const val IMPLICIT_GRANT_GRACE_MS = 2_000L
+        private const val IMPLICIT_GRANT_POLL_MS = 100L
 
         /**
          * Find all connected Carlinkit devices.

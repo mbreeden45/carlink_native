@@ -93,8 +93,18 @@ class CarlinkManager(
     private var discardVideoBuffer: ByteArray = ByteArray(256 * 1024)
 
     companion object {
-        private const val USB_WAIT_PERIOD_MS = 3000L
-        private const val PAIR_TIMEOUT_MS = 15000L
+        // Appliance fast-boot polling: grab the adapter within one poll of it enumerating on the
+        // USB bus, rather than sleeping 3 s between checks. DEVICE_WAIT_MS caps the total wait so a
+        // genuinely-absent adapter still returns NO_DEVICE promptly for the supervisor to retry.
+        private const val DEVICE_POLL_MS = 250L
+        private const val DEVICE_WAIT_MS = 12_000L
+
+        // A single known iPhone re-pairs fast; nudge WiFi pairing sooner if the box is quiet.
+        private const val PAIR_TIMEOUT_MS = 8000L
+
+        // GM gminfo37 (Equinox EV ultrawide) native panel. documents/reference/gminfo/video.
+        private const val GM_NATIVE_WIDTH = 2400
+        private const val GM_NATIVE_HEIGHT = 960
 
         // Recovery constants (matches Flutter CarlinkPlugin.kt)
         private const val RESET_THRESHOLD = 3
@@ -142,6 +152,12 @@ class CarlinkManager(
         fun onLogMessage(message: String)
 
         fun onHostUIPressed()
+
+        /** True decoded video size (crop-corrected). The UI aspect-locks the surface to it. */
+        fun onVideoSizeChanged(
+            width: Int,
+            height: Int,
+        ) {}
     }
 
     // Coroutine scope for async operations
@@ -187,6 +203,19 @@ class CarlinkManager(
     private var microphoneManager: MicrophoneCaptureManager? = null
     private var currentMicDecodeType = 5 // 16kHz mono
     private var currentMicAudioType = 3 // Siri/voice input
+
+    // The adapter announces the PCM format it wants for mic uplink via AUDIO_INPUT_CONFIG (and it is
+    // echoed on every incoming audio frame's decodeType). CarPlay phone calls use 16 kHz wideband
+    // (decodeType 5), Siri/voice 16 kHz, AA narrowband calls 8 kHz (decodeType 3). We capture mic at
+    // whatever the box last asked for instead of assuming 16 kHz, then clamp: 24 kHz / stereo
+    // (6/7) are dropped by the adapter's fixed 640 B input buffer, so they fall back to 16 kHz.
+    @Volatile private var lastInputDecodeType = 5
+
+    private fun clampMicDecodeType(decodeType: Int): Int =
+        when (decodeType) {
+            3 -> 3 // 8 kHz mono (AA / narrowband call)
+            else -> 5 // 16 kHz mono (Siri, CarPlay call, and safe fallback for 6/7)
+        }
 
     // MediaSession
     private var mediaSessionManager: MediaSessionManager? = null
@@ -273,6 +302,25 @@ class CarlinkManager(
     // Executors
     private val executors = AppExecutors()
 
+    // Detected once. Lets the appliance request the head unit's exact native resolution instead of
+    // whatever the laid-out surface happens to be, so the adapter streams the panel's true aspect
+    // ratio rather than snapping to a nearby tier (the usual cause of ultrawide stretching).
+    private val platform by lazy { PlatformDetector.detect(context) }
+
+    /**
+     * The resolution to hand the adapter via OPEN. On the GM gminfo37 head unit this is pinned to
+     * the panel's native 2400x960 (2.5:1); on any other hardware the actual surface size is used.
+     */
+    private fun openResolutionFor(
+        surfaceWidth: Int,
+        surfaceHeight: Int,
+    ): Pair<Int, Int> =
+        if (platform.isGmInfo37() && surfaceWidth > 0 && surfaceHeight > 0) {
+            GM_NATIVE_WIDTH to GM_NATIVE_HEIGHT
+        } else {
+            (surfaceWidth and 1.inv()) to (surfaceHeight and 1.inv())
+        }
+
     // LogCallback for Java components
     private val logCallback = LogCallback { message -> log(message) }
 
@@ -293,17 +341,15 @@ class CarlinkManager(
         surfaceHeight: Int,
         callback: Callback,
     ) {
-        // Round to even numbers for H.264 compatibility
-        val evenWidth = surfaceWidth and 1.inv()
-        val evenHeight = surfaceHeight and 1.inv()
+        // Resolution handed to the adapter. On GM gminfo37 this is pinned to the native 2400x960
+        // so the adapter streams the true panel aspect ratio; elsewhere the actual (even) surface
+        // size is used. Even dimensions are required for H.264 macroblock alignment.
+        val (evenWidth, evenHeight) = openResolutionFor(surfaceWidth, surfaceHeight)
 
-        // Update config with actual surface dimensions
-        // This ensures adapter is configured for the correct resolution based on actual layout
-        // (with or without system bar insets depending on immersive mode)
         if (config.width != evenWidth || config.height != evenHeight) {
             logInfo(
                 "[RES] Updating config from ${config.width}x${config.height} to ${evenWidth}x$evenHeight " +
-                    "(actual surface size)",
+                    "(surface=${surfaceWidth}x$surfaceHeight, gmNative=${platform.isGmInfo37()})",
                 tag = Logger.Tags.VIDEO,
             )
             config = config.copy(width = evenWidth, height = evenHeight)
@@ -394,6 +440,13 @@ class CarlinkManager(
         h264Renderer?.setKeyframeRequestCallback {
             logInfo("[KEYFRAME] Requesting keyframe after codec reset", tag = Logger.Tags.VIDEO)
             adapterDriver?.sendCommand(CommandMapping.FRAME)
+        }
+
+        // Forward the decoded video size so the UI can aspect-lock the surface (ultrawide letterbox
+        // instead of stretch). Reads the current callback each time, so it survives surface rebinds.
+        h264Renderer?.setVideoSizeListener { w, h ->
+            logInfo("[RES] Decoded video size reported: ${w}x$h", tag = Logger.Tags.VIDEO)
+            callback?.onVideoSizeChanged(w, h)
         }
 
         // Start the H264 renderer to initialize MediaCodec and begin decoding
@@ -1001,16 +1054,12 @@ class CarlinkManager(
     }
 
     private suspend fun findDevice(): UsbDeviceWrapper? {
-        var device: UsbDeviceWrapper? = null
-        var attempts = 0
+        val deadline = android.os.SystemClock.uptimeMillis() + DEVICE_WAIT_MS
+        var device = UsbDeviceWrapper.findFirst(context, usbManager) { log(it) }
 
-        while (device == null && attempts < 10) {
+        while (device == null && android.os.SystemClock.uptimeMillis() < deadline) {
+            kotlinx.coroutines.delay(DEVICE_POLL_MS)
             device = UsbDeviceWrapper.findFirst(context, usbManager) { log(it) }
-
-            if (device == null) {
-                attempts++
-                kotlinx.coroutines.delay(USB_WAIT_PERIOD_MS)
-            }
         }
 
         if (device != null) {
@@ -1142,8 +1191,9 @@ class CarlinkManager(
                 if (message.command == CommandMapping.REQUEST_HOST_UI) {
                     callback?.onHostUIPressed()
                 } else if (message.command == CommandMapping.START_RECORD_AUDIO) {
-                    logInfo("[CMD] Adapter requests microphone (START_RECORD_AUDIO)", tag = Logger.Tags.MIC)
-                    micScope.launch { startMicrophoneCapture(decodeType = 5, audioType = 3) }
+                    val wanted = clampMicDecodeType(lastInputDecodeType)
+                    logInfo("[CMD] Adapter requests microphone (START_RECORD_AUDIO, decodeType=$wanted)", tag = Logger.Tags.MIC)
+                    micScope.launch { startMicrophoneCapture(decodeType = wanted, audioType = 3) }
                 } else if (message.command == CommandMapping.STOP_RECORD_AUDIO) {
                     logInfo("[CMD] Adapter released microphone (STOP_RECORD_AUDIO)", tag = Logger.Tags.MIC)
                     micScope.launch { stopMicrophoneCapture() }
@@ -1155,6 +1205,12 @@ class CarlinkManager(
             }
 
             else -> {}
+        }
+
+        // Track the adapter's requested mic PCM format from every audio frame it sends, so a later
+        // START_RECORD_AUDIO / Siri / call captures at the format the box actually expects.
+        if (message is AudioDataMessage) {
+            lastInputDecodeType = message.decodeType
         }
 
         // Handle audio commands for mic capture
@@ -1200,12 +1256,13 @@ class CarlinkManager(
 
             AudioCommand.AUDIO_SIRI_START -> {
                 logInfo("[AUDIO_CMD] Siri started - enabling microphone", tag = Logger.Tags.MIC)
-                micScope.launch { startMicrophoneCapture(decodeType = 5, audioType = 3) }
+                micScope.launch { startMicrophoneCapture(decodeType = clampMicDecodeType(lastInputDecodeType), audioType = 3) }
             }
 
             AudioCommand.AUDIO_PHONECALL_START -> {
-                logInfo("[AUDIO_CMD] Phone call started - enabling microphone", tag = Logger.Tags.MIC)
-                micScope.launch { startMicrophoneCapture(decodeType = 5, audioType = 3) }
+                val wanted = clampMicDecodeType(lastInputDecodeType)
+                logInfo("[AUDIO_CMD] Phone call started - enabling microphone (decodeType=$wanted)", tag = Logger.Tags.MIC)
+                micScope.launch { startMicrophoneCapture(decodeType = wanted, audioType = 3) }
             }
 
             AudioCommand.AUDIO_SIRI_STOP -> {
@@ -1235,7 +1292,15 @@ class CarlinkManager(
             }
 
             AudioCommand.AUDIO_INPUT_CONFIG -> {
-                logInfo("[AUDIO_CMD] Audio input config received (mic format negotiation)", tag = Logger.Tags.MIC)
+                val wanted = clampMicDecodeType(lastInputDecodeType)
+                logInfo("[AUDIO_CMD] Audio input config received (decodeType=$wanted)", tag = Logger.Tags.MIC)
+                // If capture is already live at a different format, re-open it at the new one so the
+                // adapter keeps receiving PCM it can forward (a mid-session 16k<->8k switch otherwise
+                // left the box receiving wrongly-sized frames and the far end hearing silence).
+                if (microphoneManager?.isCapturing() == true && currentMicDecodeType != wanted) {
+                    logInfo("[AUDIO_CMD] INPUT_CONFIG: switching mic $currentMicDecodeType -> $wanted", tag = Logger.Tags.MIC)
+                    micScope.launch { startMicrophoneCapture(decodeType = wanted, audioType = currentMicAudioType) }
+                }
             }
 
             AudioCommand.AUDIO_OUTPUT_START -> {

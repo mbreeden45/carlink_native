@@ -18,6 +18,11 @@ for that connection without any dialog. The default is stored **per package name
 - Waits up to 5 minutes for an answer to a permission dialog instead of 30 s (answering late used to
   be discarded and re-prompted), and waits 60 s before asking again after a refusal.
 
+**What the app now does (build 63).** On connect, `UsbDeviceWrapper.openWithPermission()` waits a
+2 s grace window for that implicit grant to appear after the adapter enumerates, and only shows the
+system dialog if it never arrives. On a normal cold boot with "Always" ticked, you should see
+`[USB] USB permission already held (granted by attach launch) - no dialog needed` and no prompt.
+
 **What an app cannot do.** A normal app cannot grant itself USB access with no user action at all;
 that needs a system/privileged permission. The "Always" tick is the only mechanism, so:
 - Tick **Always** once and don't change the package name afterwards. **Changing `applicationId`

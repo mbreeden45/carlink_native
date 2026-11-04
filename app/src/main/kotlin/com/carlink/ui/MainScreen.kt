@@ -12,13 +12,17 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -36,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -80,6 +85,11 @@ fun MainScreen(
     var isResetting by remember { mutableStateOf(false) }
     val surfaceState = rememberVideoSurfaceState()
 
+    // Decoded video aspect ratio (width/height). 0 until the first frame's format is known; the
+    // VideoSurface fills the panel until then, then locks to this so the ultrawide display
+    // letterboxes a non-matching stream instead of stretching it.
+    var videoAspect by remember { mutableFloatStateOf(0f) }
+
     // Track connection start to avoid restarting on surface recreation
     var hasStartedConnection by remember { mutableStateOf(false) }
 
@@ -118,6 +128,10 @@ fun MainScreen(
                     override fun onHostUIPressed() {
                         onNavigateToSettings()
                     }
+
+                    override fun onVideoSizeChanged(width: Int, height: Int) {
+                        if (width > 0 && height > 0) videoAspect = width.toFloat() / height
+                    }
                 },
             )
 
@@ -153,9 +167,28 @@ fun MainScreen(
     }
 
     Box(modifier = boxModifier) {
-        VideoSurface(
+        // Letterbox: center the surface and lock it to the decoded aspect ratio. When the panel is
+        // wider than the video we pin height and shrink width (pillarbox); when taller, the reverse.
+        // Until the first frame's size is known, fill the panel (previous behavior).
+        BoxWithConstraints(
             modifier = Modifier.fillMaxSize(),
-            onSurfaceAvailable = { surface, width, height ->
+            contentAlignment = Alignment.Center,
+        ) {
+            val surfaceModifier =
+                if (videoAspect > 0f) {
+                    val panelAspect =
+                        if (maxHeight.value > 0f) maxWidth.value / maxHeight.value else videoAspect
+                    if (panelAspect > videoAspect) {
+                        Modifier.fillMaxHeight().aspectRatio(videoAspect)
+                    } else {
+                        Modifier.fillMaxWidth().aspectRatio(videoAspect)
+                    }
+                } else {
+                    Modifier.fillMaxSize()
+                }
+            VideoSurface(
+                modifier = surfaceModifier,
+                onSurfaceAvailable = { surface, width, height ->
                 logInfo("[UI_SURFACE] Available: ${width}x$height", tag = "UI")
                 surfaceState.onSurfaceAvailable(surface, width, height)
             },
@@ -182,7 +215,8 @@ fun MainScreen(
                 handleTouchEvent(event, activeTouches, carlinkManager, surfaceState.width, surfaceState.height)
                 true
             },
-        )
+            )
+        }
         if (isLoading) {
             Box(
                 modifier = Modifier

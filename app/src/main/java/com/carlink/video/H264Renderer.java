@@ -85,6 +85,23 @@ public class H264Renderer {
         void onKeyframeNeeded();
     }
 
+    /**
+     * Reports the TRUE decoded video size (crop-rect corrected) whenever MediaCodec resolves the
+     * stream format. The UI uses it to aspect-lock the SurfaceView so a decoded frame whose aspect
+     * ratio differs from the ultrawide panel is letterboxed instead of stretched.
+     */
+    public interface VideoSizeListener {
+        void onVideoSize(int width, int height);
+    }
+
+    private volatile VideoSizeListener videoSizeListener;
+    private int reportedVideoWidth = 0;
+    private int reportedVideoHeight = 0;
+
+    public void setVideoSizeListener(VideoSizeListener listener) {
+        this.videoSizeListener = listener;
+    }
+
     // Thread safety lock for codec lifecycle operations
     // Prevents race conditions between callbacks and reset/stop operations
     // See: https://android.googlesource.com/platform/cts/+/0e8a8a0%5E!/
@@ -318,6 +335,14 @@ public class H264Renderer {
             synchronized (codecLock) {
                 initCodec(width, height, surface);
                 mCodec.start();
+                // Scale the decoded buffer to the Surface bounds. The UI keeps the Surface itself at
+                // the decoded aspect ratio (see VideoSizeListener -> VideoSurfaceView.setVideoAspect),
+                // so SCALE_TO_FIT here fills that AR-correct rect exactly with no stretching.
+                try {
+                    mCodec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
+                } catch (Exception scaleEx) {
+                    log("setVideoScalingMode not supported: " + scaleEx.getMessage());
+                }
                 codecStartTime = System.currentTimeMillis();  // Record start time for stabilization
             }
             log("codec started successfully");
@@ -1148,9 +1173,37 @@ public class H264Renderer {
                     int formatWidth = format.getInteger("width");
                     int formatHeight = format.getInteger("height");
 
+                    // Prefer the crop rectangle: hardware decoders round the coded size up to a
+                    // macroblock multiple (e.g. 960 -> 968), and only the crop rect is the real
+                    // visible frame. Using the coded size to aspect-lock would letterbox a few
+                    // pixels wrong on the ultrawide panel.
+                    int visibleWidth = formatWidth;
+                    int visibleHeight = formatHeight;
+                    if (format.containsKey("crop-left") && format.containsKey("crop-right")
+                            && format.containsKey("crop-top") && format.containsKey("crop-bottom")) {
+                        visibleWidth = format.getInteger("crop-right") - format.getInteger("crop-left") + 1;
+                        visibleHeight = format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1;
+                    }
+
                     log("[Media Codec] onOutputFormatChanged - Format: " + format);
-                    log("[Media Codec] Output format - Color: " + colorFormat + ", Size: " + formatWidth + "x" + formatHeight);
+                    log("[Media Codec] Output format - Color: " + colorFormat + ", coded: " + formatWidth + "x" + formatHeight
+                            + ", visible: " + visibleWidth + "x" + visibleHeight);
                     VideoDebugLogger.logCodecFormatChanged(formatWidth, formatHeight, colorFormat);
+
+                    // Notify the UI of the true visible size so it can aspect-lock the Surface.
+                    if (visibleWidth > 0 && visibleHeight > 0
+                            && (visibleWidth != reportedVideoWidth || visibleHeight != reportedVideoHeight)) {
+                        reportedVideoWidth = visibleWidth;
+                        reportedVideoHeight = visibleHeight;
+                        VideoSizeListener l = videoSizeListener;
+                        if (l != null) {
+                            try {
+                                l.onVideoSize(visibleWidth, visibleHeight);
+                            } catch (Exception cbEx) {
+                                log("videoSizeListener threw: " + cbEx.getMessage());
+                            }
+                        }
+                    }
                 }
             }
         };
