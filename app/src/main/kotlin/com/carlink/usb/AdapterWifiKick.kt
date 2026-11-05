@@ -25,6 +25,8 @@ object AdapterWifiKick {
     private const val PATH = "/cgi-bin/server.cgi"
     private const val TIMEOUT_MS = 3_000
 
+    enum class Outcome { ACCEPTED, REJECTED, FAILED, NO_WIFI, NO_SECRET }
+
     data class SignedForm(
         val body: String,
         val signedText: String,
@@ -70,15 +72,15 @@ object AdapterWifiKick {
         context: Context,
         secret: String,
         log: (String) -> Unit,
-    ): Boolean {
+    ): Outcome {
         if (secret.isBlank()) {
             log("[BOX_KICK] Not configured (no CARLINK_BOX_SECRET in this build) - skipping")
-            return false
+            return Outcome.NO_SECRET
         }
         val wifi = findWifiNetwork(context)
         if (wifi == null) {
             log("[BOX_KICK] Head unit is not on any Wi-Fi network - join the adapter's Wi-Fi in car settings")
-            return false
+            return Outcome.NO_WIFI
         }
         for ((i, separator) in listOf("", " ").withIndex()) {
             val form = buildForm(System.currentTimeMillis(), secret, separator)
@@ -87,13 +89,13 @@ object AdapterWifiKick {
                     post(wifi, form.body)
                 } catch (e: Exception) {
                     log("[BOX_KICK] Request to $BOX_HOST failed: ${e.javaClass.simpleName}: ${e.message}")
-                    return false // network-level failure: a second signature variant will not help
+                    return Outcome.FAILED // network-level failure: a second signature variant will not help
                 }
             val ok = isSuccess(reply)
             log("[BOX_KICK] Sent Udisk=1 to $BOX_HOST (variant ${i + 1}) -> ${if (ok) "accepted" else "rejected"}: ${reply.take(120)}")
-            if (ok) return true
+            if (ok) return Outcome.ACCEPTED
         }
-        return false
+        return Outcome.REJECTED
     }
 
     private fun post(

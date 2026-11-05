@@ -48,7 +48,9 @@ The grey line under **[ Connecting... ]** tells you what's happening:
 |---|---|
 | Looking for the adapter on USB | Normal for the first second or two. |
 | Adapter not detected on USB - retrying | The adapter hasn't shown up on USB yet. |
+| Adapter not on USB - connect the car to the adapter's Wi-Fi ("carlink") to wake it | The adapter needs waking but the car isn't on its Wi-Fi. Join "carlink" in the car's Wi-Fi settings; the request goes out the moment it connects. |
 | Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode | The automatic replacement for the Shortcut is running. |
+| Adapter accepted the Wi-Fi request - waiting for it on USB | It worked; the adapter should appear within a few seconds. |
 | Adapter found - tap OK on the USB prompt now | Tap OK within about 9 seconds. |
 | Adapter re-connected on USB while asking for access - retrying | The adapter restarted before you tapped; a new prompt follows within a second. |
 | Starting adapter | Permission granted; connecting. |

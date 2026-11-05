@@ -123,7 +123,12 @@ class CarlinkManager(
         // Wi-Fi "kick" (AdapterWifiKick): only once the adapter has been absent from USB longer than
         // its own ~3.5 s restart gap, and at most once a minute.
         private const val KICK_AFTER_ABSENT_MS = 8_000L
-        private const val KICK_COOLDOWN_MS = 60_000L
+        // After a failed/rejected request, try again this soon. After an accepted one, give the adapter
+        // this long to appear on USB before asking again. "Not on Wi-Fi" consumes no wait at all: the
+        // request fires the moment the car joins the adapter's Wi-Fi.
+        private const val KICK_RETRY_MS = 20_000L
+        private const val KICK_SETTLE_MS = 45_000L
+        private const val KICK_TICK_MS = 5_000L
 
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
@@ -242,28 +247,6 @@ class CarlinkManager(
     // Single in-flight USB attach debounce (see onUsbDeviceAttached).
     private var attachJob: Job? = null
 
-    // Wi-Fi kick bookkeeping (uptime ms). "Seen" starts at creation so a cold boot kicks 8 s in.
-    @Volatile private var lastAdapterSeenMs = android.os.SystemClock.uptimeMillis()
-
-    @Volatile private var lastKickMs = 0L
-    private var kickJob: Job? = null
-
-    /**
-     * The adapter has not been on USB for a while: ask it over Wi-Fi to switch to its CarPlay USB
-     * mode (what the user's iOS Shortcut did). Non-blocking; the attach broadcast picks it up.
-     */
-    private fun maybeKickAdapterOverWifi() {
-        val now = android.os.SystemClock.uptimeMillis()
-        if (now - lastAdapterSeenMs < KICK_AFTER_ABSENT_MS) return
-        if (lastKickMs != 0L && now - lastKickMs < KICK_COOLDOWN_MS) return
-        if (kickJob?.isActive == true) return
-        lastKickMs = now
-        setConnectionDetail("Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode")
-        kickJob =
-            connectionScope.launch {
-                AdapterWifiKick.send(context, BuildConfig.BOX_API_SECRET) { logInfo(it, tag = Logger.Tags.USB) }
-            }
-    }
 
     // Last USB bus snapshot logged when no adapter was found; only re-logged when it changes.
     @Volatile private var lastBusSnapshot: String? = null
@@ -295,6 +278,93 @@ class CarlinkManager(
     // Connection lifecycle. The supervisor lives in a manager-owned scope (NOT the UI scope) so a
     // recomposition or cancelled LaunchedEffect can never abandon a half-open connection.
     private val connectionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // Wi-Fi kick bookkeeping (uptime ms). "Seen" starts at creation so a cold boot kicks 8 s in.
+    @Volatile private var lastAdapterSeenMs = android.os.SystemClock.uptimeMillis()
+
+    @Volatile private var nextKickAllowedMs = 0L
+
+    @Volatile private var kickWaitingForWifi = false
+    private var kickJob: Job? = null
+
+    /**
+     * The adapter has not been on USB for a while: ask it over Wi-Fi to switch to its CarPlay USB
+     * mode (what the user's iOS Shortcut did). Non-blocking; the attach broadcast picks it up.
+     * Called from the device search, from a 5 s ticker, and the moment the car joins a Wi-Fi network.
+     */
+    private fun maybeKickAdapterOverWifi() {
+        if (state == State.DEVICE_CONNECTED || state == State.STREAMING) return
+        val now = android.os.SystemClock.uptimeMillis()
+        if (UsbDeviceWrapper.findDevices(usbManager).isNotEmpty()) {
+            lastAdapterSeenMs = now
+            return
+        }
+        if (now - lastAdapterSeenMs < KICK_AFTER_ABSENT_MS) return
+        if (now < nextKickAllowedMs) return
+        if (kickJob?.isActive == true) return
+        if (AdapterWifiKick.findWifiNetwork(context) == null) {
+            if (!kickWaitingForWifi) {
+                kickWaitingForWifi = true
+                logInfo("[BOX_KICK] Waiting: car is not on the adapter's Wi-Fi yet", tag = Logger.Tags.USB)
+            }
+            setConnectionDetail("Adapter not on USB - connect the car to the adapter's Wi-Fi (\"carlink\") to wake it")
+            return // consumes no wait: fires as soon as Wi-Fi appears
+        }
+        kickWaitingForWifi = false
+        nextKickAllowedMs = now + KICK_RETRY_MS // provisional; prevents a double fire
+        setConnectionDetail("Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode")
+        kickJob =
+            connectionScope.launch {
+                val outcome = AdapterWifiKick.send(context, BuildConfig.BOX_API_SECRET) { logInfo(it, tag = Logger.Tags.USB) }
+                val after = android.os.SystemClock.uptimeMillis()
+                nextKickAllowedMs =
+                    when (outcome) {
+                        AdapterWifiKick.Outcome.ACCEPTED -> after + KICK_SETTLE_MS
+                        AdapterWifiKick.Outcome.NO_SECRET -> Long.MAX_VALUE // build has no secret: never
+                        AdapterWifiKick.Outcome.NO_WIFI -> 0L // Wi-Fi dropped in between: retry when back
+                        else -> after + KICK_RETRY_MS
+                    }
+                if (outcome == AdapterWifiKick.Outcome.ACCEPTED) {
+                    setConnectionDetail("Adapter accepted the Wi-Fi request - waiting for it on USB")
+                }
+            }
+    }
+
+    // Re-checks every few seconds, including between connection attempts (whose back-off grows to 30 s).
+    private val kickTicker =
+        connectionScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(KICK_TICK_MS)
+                runCatching { maybeKickAdapterOverWifi() }
+            }
+        }
+
+    // The instant the car joins a Wi-Fi network (e.g. the adapter's, which comes up some seconds after
+    // power-on), try straight away instead of waiting for the next tick or connection attempt.
+    private val wifiCallback =
+        object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                logInfo("[BOX_KICK] Car joined a Wi-Fi network", tag = Logger.Tags.USB)
+                nextKickAllowedMs = 0L
+                connectionScope.launch {
+                    kotlinx.coroutines.delay(1_500) // let addressing settle
+                    maybeKickAdapterOverWifi()
+                }
+            }
+        }
+
+    private val wifiCallbackRegistered: Boolean =
+        runCatching {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val request =
+                android.net.NetworkRequest.Builder()
+                    .addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI)
+                    // The adapter's Wi-Fi has no internet; don't require it.
+                    .removeCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+            cm.registerNetworkCallback(request, wifiCallback)
+            true
+        }.getOrDefault(false)
     private val teardownLock = Any()
 
     // Mic start/stop run here, strictly in order, and never on the USB read thread: starting capture
@@ -731,7 +801,13 @@ class CarlinkManager(
         val device = findDevice()
         if (device == null) {
             logError("Failed to find Carlinkit device", tag = Logger.Tags.USB)
-            setConnectionDetail("Adapter not detected on USB - retrying")
+            setConnectionDetail(
+                if (AdapterWifiKick.findWifiNetwork(context) == null) {
+                    "Adapter not on USB - connect the car to the adapter's Wi-Fi (\"carlink\") to wake it"
+                } else {
+                    "Adapter not detected on USB - retrying"
+                },
+            )
             return ConnectResult.NO_DEVICE
         }
 
@@ -923,6 +999,13 @@ class CarlinkManager(
      * Release all resources.
      */
     fun release() {
+        kickTicker.cancel()
+        if (wifiCallbackRegistered) {
+            runCatching {
+                (context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager)
+                    .unregisterNetworkCallback(wifiCallback)
+            }
+        }
         supervisor.close()
         teardown()
         setState(State.DISCONNECTED)
