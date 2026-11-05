@@ -115,7 +115,9 @@ class CarlinkManager(
         private const val SURFACE_WAIT_MS = 20_000L
 
         // Let the system finish enumerating the adapter after a USB attach event
-        private const val ATTACH_SETTLE_MS = 600L
+        // Short on purpose: an unopened adapter re-enumerates ~9 s after attaching, and the user needs
+        // as much of that window as possible to tap OK on the USB prompt.
+        private const val ATTACH_SETTLE_MS = 150L
 
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
@@ -707,7 +709,7 @@ class CarlinkManager(
         usbDevice = device
 
         if (!device.hasPermission()) {
-            setConnectionDetail("Adapter found - waiting for USB access (tap OK, tick \"Always open\" if offered)")
+            setConnectionDetail("Adapter found - tap OK on the USB prompt now (it restarts in ~9 s if not opened)")
         }
         if (!device.openWithPermission()) {
             logError(
