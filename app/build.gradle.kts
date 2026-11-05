@@ -41,6 +41,15 @@ android {
                 ?: 100
         versionName = "1.2.0"
 
+        // Adapter web-config signing secret for AdapterWifiKick, injected by CI from the
+        // CARLINK_BOX_SECRET repository secret. Never committed; empty disables the Wi-Fi kick.
+        val boxSecret = System.getenv("CARLINK_BOX_SECRET") ?: ""
+        buildConfigField(
+            "String",
+            "BOX_API_SECRET",
+            "\"" + boxSecret.replace("\\", "\\\\").replace("\"", "\\\"") + "\"",
+        )
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         vectorDrawables {

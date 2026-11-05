@@ -28,6 +28,7 @@ object DiagnosticJournal {
             "[USB_PERM]",
             "[USB_ID]",
             "[USB_BUS]",
+            "[BOX_KICK]",
             "[USB_ATTACH]",
             "[USB_DETACH]",
             "[STATUS]",
