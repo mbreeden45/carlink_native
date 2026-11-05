@@ -42,6 +42,7 @@ import com.carlink.ui.settings.BehaviorPreferences
 import com.carlink.ui.settings.MicSourceConfig
 import com.carlink.ui.settings.WiFiBandConfig
 import com.carlink.usb.AdapterWifiKick
+import com.carlink.usb.AdapterWifiLink
 import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AppExecutors
 import com.carlink.util.LogCallback
@@ -287,6 +288,25 @@ class CarlinkManager(
     @Volatile private var kickWaitingForWifi = false
     private var kickJob: Job? = null
 
+    // App-managed join of the adapter's Wi-Fi (the car does not rejoin it by itself at power-up).
+    private val wifiLink =
+        AdapterWifiLink(
+            context = context,
+            ssid = BuildConfig.BOX_WIFI_SSID,
+            passphrase = BuildConfig.BOX_WIFI_PSK,
+            log = { logInfo(it, tag = Logger.Tags.USB) },
+            onJoined = {
+                nextKickAllowedMs = 0L
+                connectionScope.launch {
+                    kotlinx.coroutines.delay(1_500) // let addressing settle
+                    maybeKickAdapterOverWifi()
+                }
+            },
+        )
+
+    private val joiningWifiDetail = "Adapter not on USB - joining the adapter's Wi-Fi (\"carlink\") to wake it"
+    private val noWifiDetail = "Adapter not on USB - connect the car to the adapter's Wi-Fi (\"carlink\") to wake it"
+
     /**
      * The adapter has not been on USB for a while: ask it over Wi-Fi to switch to its CarPlay USB
      * mode (what the user's iOS Shortcut did). Non-blocking; the attach broadcast picks it up.
@@ -302,12 +322,17 @@ class CarlinkManager(
         if (now - lastAdapterSeenMs < KICK_AFTER_ABSENT_MS) return
         if (now < nextKickAllowedMs) return
         if (kickJob?.isActive == true) return
-        if (AdapterWifiKick.findWifiNetwork(context) == null) {
+        if ((wifiLink.network ?: AdapterWifiKick.findWifiNetwork(context)) == null) {
             if (!kickWaitingForWifi) {
                 kickWaitingForWifi = true
                 logInfo("[BOX_KICK] Waiting: car is not on the adapter's Wi-Fi yet", tag = Logger.Tags.USB)
             }
-            setConnectionDetail("Adapter not on USB - connect the car to the adapter's Wi-Fi (\"carlink\") to wake it")
+            if (wifiLink.isConfigured) {
+                wifiLink.ensureRequested()
+                setConnectionDetail(joiningWifiDetail)
+            } else {
+                setConnectionDetail(noWifiDetail)
+            }
             return // consumes no wait: fires as soon as Wi-Fi appears
         }
         kickWaitingForWifi = false
@@ -315,7 +340,10 @@ class CarlinkManager(
         setConnectionDetail("Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode")
         kickJob =
             connectionScope.launch {
-                val outcome = AdapterWifiKick.send(context, BuildConfig.BOX_API_SECRET) { logInfo(it, tag = Logger.Tags.USB) }
+                val outcome =
+                    AdapterWifiKick.send(context, BuildConfig.BOX_API_SECRET, wifiLink.network) {
+                        logInfo(it, tag = Logger.Tags.USB)
+                    }
                 val after = android.os.SystemClock.uptimeMillis()
                 nextKickAllowedMs =
                     when (outcome) {
@@ -802,8 +830,8 @@ class CarlinkManager(
         if (device == null) {
             logError("Failed to find Carlinkit device", tag = Logger.Tags.USB)
             setConnectionDetail(
-                if (AdapterWifiKick.findWifiNetwork(context) == null) {
-                    "Adapter not on USB - connect the car to the adapter's Wi-Fi (\"carlink\") to wake it"
+                if ((wifiLink.network ?: AdapterWifiKick.findWifiNetwork(context)) == null) {
+                    if (wifiLink.isConfigured) joiningWifiDetail else noWifiDetail
                 } else {
                     "Adapter not detected on USB - retrying"
                 },
@@ -1000,6 +1028,7 @@ class CarlinkManager(
      */
     fun release() {
         kickTicker.cancel()
+        wifiLink.release()
         if (wifiCallbackRegistered) {
             runCatching {
                 (context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager)
@@ -1205,7 +1234,10 @@ class CarlinkManager(
             callback?.onStateChanged(newState)
             updateMediaSessionState(newState)
             // The adapter is up: the USB-level detail no longer applies.
-            if (newState == State.DEVICE_CONNECTED || newState == State.STREAMING) setConnectionDetail("")
+            if (newState == State.DEVICE_CONNECTED || newState == State.STREAMING) {
+                setConnectionDetail("")
+                wifiLink.release() // adapter is up over USB; stop holding its Wi-Fi
+            }
 
             if (newState == State.STREAMING) {
                 val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false

@@ -43,12 +43,12 @@ android {
 
         // Adapter web-config signing secret for AdapterWifiKick, injected by CI from the
         // CARLINK_BOX_SECRET repository secret. Never committed; empty disables the Wi-Fi kick.
-        val boxSecret = System.getenv("CARLINK_BOX_SECRET") ?: ""
-        buildConfigField(
-            "String",
-            "BOX_API_SECRET",
-            "\"" + boxSecret.replace("\\", "\\\\").replace("\"", "\\\"") + "\"",
-        )
+        fun javaString(v: String) = "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+        buildConfigField("String", "BOX_API_SECRET", javaString(System.getenv("CARLINK_BOX_SECRET") ?: ""))
+        // Adapter Wi-Fi the app joins by itself (AdapterWifiLink). PSK from the CARLINK_BOX_WIFI_PSK CI
+        // secret; empty disables the app-managed join.
+        buildConfigField("String", "BOX_WIFI_SSID", javaString(System.getenv("CARLINK_BOX_WIFI_SSID") ?: "carlink"))
+        buildConfigField("String", "BOX_WIFI_PSK", javaString(System.getenv("CARLINK_BOX_WIFI_PSK") ?: ""))
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
