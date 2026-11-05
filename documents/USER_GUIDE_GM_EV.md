@@ -18,7 +18,7 @@ No iPhone Shortcut.
 3. **On the iPhone, forget the car's own Bluetooth** (Settings → Bluetooth → ⓘ next to the car →
    Forget This Device). Otherwise iOS can send audio to the car's Bluetooth instead of CarPlay.
 4. **Let the app use the adapter's Wi-Fi.** On first start, Carlink asks Android to join the
-   adapter's network ("carlink"). Approve the **"connect to carlink?"** prompt once; after that it
+   adapter's network ("carlink"). When **"Device to use with Carlink"** appears (it lists "carlink"), tap **Connect** once; after that it
    rejoins by itself. The car shows "no internet" on that network; that's expected, and the car keeps
    using cellular for everything else. (GM cars don't rejoin this network on their own at power-up,
    which is why the app does it.)
@@ -53,10 +53,10 @@ The grey line under **[ Connecting... ]** tells you what's happening:
 |---|---|
 | Looking for the adapter on USB | Normal for the first second or two. |
 | Adapter not detected on USB - retrying | The adapter hasn't shown up on USB yet. |
-| Adapter not on USB - joining the adapter's Wi-Fi ("carlink") to wake it | The app is joining the adapter's Wi-Fi. The first time, approve the "connect to carlink?" prompt. |
+| Adapter not on USB - joining the adapter's Wi-Fi ("carlink") to wake it | The app is joining the adapter's Wi-Fi. The first time, tap **Connect** on "Device to use with Carlink". |
 | Adapter not on USB - connect the car to the adapter's Wi-Fi ("carlink") to wake it | The adapter needs waking but the car isn't on its Wi-Fi. Join "carlink" in the car's Wi-Fi settings; the request goes out the moment it connects. |
 | Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode | The automatic replacement for the Shortcut is running. |
-| Adapter accepted the Wi-Fi request - waiting for it on USB | It worked; the adapter should appear within a few seconds. |
+| Adapter accepted the Wi-Fi request - waiting for it on USB | It worked; the adapter appears on USB about 10 seconds later. GM's "USB Device not supported" pop-up may show at the same time; ignore it. |
 | Adapter found - tap OK on the USB prompt now | Tap OK within about 9 seconds. |
 | Adapter re-connected on USB while asking for access - retrying | The adapter restarted before you tapped; a new prompt follows within a second. |
 | Starting adapter | Permission granted; connecting. |
