@@ -159,6 +159,12 @@ class CarlinkManager(
             width: Int,
             height: Int,
         ) {}
+
+        /**
+         * One-line, driver-readable reason for the current not-streaming state ("adapter not on USB",
+         * "waiting for USB access", ...). Empty when there is nothing to add. Main thread.
+         */
+        fun onConnectionDetail(detail: String) {}
     }
 
     // Coroutine scope for async operations
@@ -227,6 +233,19 @@ class CarlinkManager(
 
     // Single in-flight USB attach debounce (see onUsbDeviceAttached).
     private var attachJob: Job? = null
+
+    // Last USB bus snapshot logged when no adapter was found; only re-logged when it changes.
+    @Volatile private var lastBusSnapshot: String? = null
+
+    @Volatile private var connectionDetail = ""
+
+    /** Publish [detail] to the UI (deduplicated, main thread). */
+    private fun setConnectionDetail(detail: String) {
+        if (detail == connectionDetail) return
+        connectionDetail = detail
+        if (detail.isNotEmpty()) logInfo("[STATUS] $detail", tag = Logger.Tags.USB)
+        scope.launch { this@CarlinkManager.callback?.onConnectionDetail(detail) }
+    }
 
     // MediaSession
     private var mediaSessionManager: MediaSessionManager? = null
@@ -676,24 +695,39 @@ class CarlinkManager(
 
         // Find device
         log("Searching for Carlinkit device...")
+        setConnectionDetail("Looking for the adapter on USB")
         val device = findDevice()
         if (device == null) {
             logError("Failed to find Carlinkit device", tag = Logger.Tags.USB)
+            setConnectionDetail("Adapter not detected on USB - retrying")
             return ConnectResult.NO_DEVICE
         }
 
-        log("Device found, opening")
+        log("Device found, opening: ${device.describe()}")
         usbDevice = device
 
+        if (!device.hasPermission()) {
+            setConnectionDetail("Adapter found - waiting for USB access (tap OK, tick \"Always open\" if offered)")
+        }
         if (!device.openWithPermission()) {
             logError(
-                "Failed to open USB device (denied=${device.permissionDenied}, detached=${device.detached})",
+                "Failed to open USB device (denied=${device.permissionDenied}, " +
+                    "dismissedBySystem=${device.dismissedWithoutAnswer}, detached=${device.detached})",
                 tag = Logger.Tags.USB,
             )
-            // A device that vanished mid-wait is a re-enumeration, not a refusal: FAILED (short
-            // backoff), never PERMISSION_DENIED (60 s backoff).
+            setConnectionDetail(
+                when {
+                    device.permissionDenied -> "USB access was declined - asking again in 60 s"
+                    device.detached || device.dismissedWithoutAnswer ->
+                        "Adapter re-connected on USB while asking for access - retrying"
+                    else -> "Could not open the adapter - retrying"
+                },
+            )
+            // A device that vanished mid-wait, or a prompt the system closed by itself, is a
+            // re-enumeration, not a refusal: FAILED (short backoff), never PERMISSION_DENIED (60 s).
             return if (device.permissionDenied) ConnectResult.PERMISSION_DENIED else ConnectResult.FAILED
         }
+        setConnectionDetail("Starting adapter")
 
         // Create video processor for direct USB -> ring buffer data flow
         // This bypasses message parsing for zero-copy performance (matches Flutter architecture)
@@ -1055,6 +1089,8 @@ class CarlinkManager(
         if (oldState != newState) {
             callback?.onStateChanged(newState)
             updateMediaSessionState(newState)
+            // The adapter is up: the USB-level detail no longer applies.
+            if (newState == State.DEVICE_CONNECTED || newState == State.STREAMING) setConnectionDetail("")
 
             if (newState == State.STREAMING) {
                 val sent = adapterDriver?.sendCommand(CommandMapping.FRAME) ?: false
@@ -1122,6 +1158,14 @@ class CarlinkManager(
 
         if (device != null) {
             log("Carlinkit device found!")
+        } else {
+            // Nothing matching KnownDevices. Log what IS on the bus: this is how a cold boot that
+            // leaves the adapter in a non-CarPlay USB personality shows up (VID/PID/classes).
+            val snapshot = UsbDeviceWrapper.describeBus(usbManager)
+            if (snapshot != lastBusSnapshot) {
+                lastBusSnapshot = snapshot
+                logWarn("[USB_BUS] No known adapter after ${DEVICE_WAIT_MS}ms. $snapshot", tag = Logger.Tags.USB)
+            }
         }
 
         return device

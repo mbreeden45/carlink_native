@@ -175,3 +175,17 @@ Corrections to claims above, and the fixes that landed with them:
   Executing codec, and is never throttled away after a `pause()`. The decoded size is cached and
   replayed to the current callback on the main thread. Resizes are no longer re-announced as new
   surfaces, and OPEN uses the panel size rather than the letterboxed surface size.
+
+---
+
+## 6. Build-1002 field findings → diagnostics and fixes
+
+| Symptom (in car) | What the code can and cannot do | Change in this pass |
+|---|---|---|
+| Permission dialog flashes and vanishes | The app has **no access to the device before permission is granted**, so it cannot claim, reset or re-enumerate it while a dialog is up. Android's USB dialogs (`UsbConfirmActivity` / `UsbPermissionActivity`) finish themselves when their device **detaches** and report that as "denied". A vanishing dialog therefore points at the adapter re-enumerating. | A "denied" in < 1.5 s, or with the device gone, is a **system dismissal**: short retry, not the 60 s refusal backoff. One app-initiated prompt per device instance, answer caught by a process-lifetime receiver (no stacked/duplicate dialogs, no lost answers when an attempt is cancelled). Every USB attach/detach on the bus is journaled with uptime (`[USB_EVENT]`). |
+| "Always open" does not persist | Android saves the default from the device's own identity (VID, PID, manufacturer, product, **serial**), not from `usb_device_filter.xml`. If any of those differ between boots or personalities (e.g. 0x1520 vs 0x1521), the saved default never matches again. The XML filter already matches both PIDs; nothing in it can change this. | `[USB_ID]` logs the full identity (incl. serial) every time the adapter is opened. Compare two boots. |
+| "USB device not supported" on cold boot | That message is the vehicle's, raised before this app runs. If the adapter is not presenting a CarPlay (vendor-class, 1314:1520/1521) interface, no host-side message can reach it. | `[USB_BUS]` snapshot of **every** device on the bus when no adapter is found; on-screen status line on the Connecting screen. |
+| Steering-wheel voice key opens GM assistant | AAOS hands the push-to-talk key to the system assistant inside CarInputService; redirecting it requires the privileged `CAR_PROJECTION` permission (not grantable to a Play app). | `[KEY]` / `[MEDIA_SESSION]` log every key the app receives. If the build delivers SEARCH / VOICE_ASSIST / ASSIST to the app, it now goes to Siri while a session is up. |
+
+**Capturing a log:** Settings → Logs → enable file logging, reproduce, export. Lines to look for:
+`[USB_EVENT]`, `[USB_PERM]`, `[USB_ID]`, `[USB_BUS]`, `[STATUS]`, `[KEY]`, `[MEDIA_SESSION]`.

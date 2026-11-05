@@ -354,7 +354,19 @@ class MediaSessionManager(
             }
 
             override fun onMediaButtonEvent(mediaButtonEvent: android.content.Intent?): Boolean {
-                log("[MEDIA_SESSION] Media button event received")
+                // Log the raw key so a drive log shows what the steering wheel delivers (keycode,
+                // and whether a held button arrives as repeats / FLAG_LONG_PRESS).
+                val key =
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        mediaButtonEvent?.getParcelableExtra(android.content.Intent.EXTRA_KEY_EVENT, android.view.KeyEvent::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        mediaButtonEvent?.getParcelableExtra(android.content.Intent.EXTRA_KEY_EVENT)
+                    }
+                log(
+                    "[MEDIA_SESSION] Media button: ${key?.let { android.view.KeyEvent.keyCodeToString(it.keyCode) }} " +
+                        "action=${key?.action} repeat=${key?.repeatCount} longPress=${key?.isLongPress}",
+                )
                 return super.onMediaButtonEvent(mediaButtonEvent)
             }
         }

@@ -10,6 +10,7 @@ import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -42,6 +43,7 @@ import com.carlink.logging.apply
 import com.carlink.logging.logInfo
 import com.carlink.logging.logWarn
 import com.carlink.protocol.AdapterConfig
+import com.carlink.protocol.CommandMapping
 import com.carlink.protocol.KnownDevices
 import com.carlink.ui.MainScreen
 import com.carlink.ui.SettingsScreen
@@ -49,6 +51,7 @@ import com.carlink.ui.settings.AdapterConfigPreference
 import com.carlink.ui.settings.DisplayMode
 import com.carlink.ui.settings.DisplayModePreference
 import com.carlink.ui.theme.CarlinkTheme
+import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AudioDebugLogger
 import com.carlink.util.IconAssets
 import com.carlink.util.VideoDebugLogger
@@ -65,6 +68,10 @@ import com.carlink.util.VideoDebugLogger
  * Ported from: example/lib/main.dart
  */
 class MainActivity : ComponentActivity() {
+    companion object {
+        private val VOICE_KEYS = setOf(KeyEvent.KEYCODE_SEARCH, KeyEvent.KEYCODE_VOICE_ASSIST, KeyEvent.KEYCODE_ASSIST)
+    }
+
     // Nullable to prevent UninitializedPropertyAccessException if Activity
     // is destroyed before initialization completes (e.g., low memory kill)
     private var carlinkManager: CarlinkManager? = null
@@ -98,6 +105,9 @@ class MainActivity : ComponentActivity() {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
             }
+        if (device != null) {
+            logInfo("[USB_EVENT] ATTACHED (intent) ${UsbDeviceWrapper.describeDevice(device, false)}", tag = "MAIN")
+        }
         if (device == null || !KnownDevices.isKnownDevice(device.vendorId, device.productId)) return
 
         logInfo(
@@ -106,6 +116,40 @@ class MainActivity : ComponentActivity() {
             tag = "MAIN",
         )
         carlinkManager?.onUsbDeviceAttached(device.deviceName)
+    }
+
+    /**
+     * Steering-wheel / hardware keys. Every key that reaches this activity is logged, which is how to
+     * tell from a drive log what the wheel actually delivers to apps.
+     *
+     * Voice keys (SEARCH / VOICE_ASSIST / ASSIST) are forwarded to Siri while an adapter session is up.
+     * On AAOS the push-to-talk button is normally consumed by CarInputService and handed to the system
+     * assistant before any app sees it (taking it over needs the privileged CAR_PROJECTION permission),
+     * so this only fires on builds that DO deliver the key to the focused app. When no session is up the
+     * key is left to the system as before.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.repeatCount == 0 || event.action == KeyEvent.ACTION_UP) {
+            logInfo(
+                "[KEY] ${KeyEvent.keyCodeToString(event.keyCode)} action=${event.action} repeat=${event.repeatCount} " +
+                    "longPress=${event.isLongPress} source=0x${event.source.toString(16)}",
+                tag = "MAIN",
+            )
+        }
+        if (event.keyCode in VOICE_KEYS) {
+            val manager = carlinkManager
+            val sessionUp =
+                manager != null &&
+                    (manager.state == CarlinkManager.State.DEVICE_CONNECTED || manager.state == CarlinkManager.State.STREAMING)
+            if (sessionUp) {
+                if (event.action == KeyEvent.ACTION_UP && !event.isCanceled) {
+                    val sent = manager!!.sendKey(CommandMapping.SIRI)
+                    logInfo("[KEY] Voice key -> Siri (sent=$sent)", tag = "MAIN")
+                }
+                return true // consume DOWN and UP so the system search/assistant does not also fire
+            }
+        }
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -129,14 +173,25 @@ class MainActivity : ComponentActivity() {
                 context: Context,
                 intent: Intent,
             ) {
+                // Journal EVERY USB attach/detach on the bus (any device, with uptime) so a log shows
+                // exactly when the adapter re-enumerates -- e.g. whether a vanished permission dialog
+                // coincided with a detach. ATTACHED here is logging only: connecting is driven by the
+                // manifest intent (handleUsbIntent), if this broadcast is delivered at all.
+                val eventDevice =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                val kind = if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) "ATTACHED (broadcast)" else "DETACHED"
+                logInfo(
+                    "[USB_EVENT] $kind t=${android.os.SystemClock.uptimeMillis()} " +
+                        (eventDevice?.let { UsbDeviceWrapper.describeDevice(it, false) } ?: "<no device extra>"),
+                    tag = "MAIN",
+                )
                 if (UsbManager.ACTION_USB_DEVICE_DETACHED == intent.action) {
-                    val device =
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                        } else {
-                            @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-                        }
+                    val device = eventDevice
 
                     device?.let {
                         // Only handle if it's a known Carlinkit device
@@ -415,7 +470,10 @@ class MainActivity : ComponentActivity() {
      * providing faster recovery than waiting for USB transfer errors.
      */
     private fun registerUsbDetachReceiver() {
-        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        val filter =
+            IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED).apply {
+                addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED) // logging only, see usbDetachReceiver
+            }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbDetachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
