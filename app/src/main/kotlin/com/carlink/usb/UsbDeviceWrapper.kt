@@ -662,12 +662,14 @@ class UsbDeviceWrapper(
         private const val PERMISSION_TIMEOUT_MS = 5 * 60_000L
 
         /**
-         * How long [openWithPermission] waits for the implicit "Always" grant (from being launched
-         * by the USB attach intent) before it shows a dialog. 2 s is comfortably longer than the
-         * observed grant-after-enumeration gap on gminfo37, and short enough that a genuine
-         * first-install still reaches the dialog quickly.
+         * How long [openWithPermission] waits for an implicit grant before raising the prompt.
+         *
+         * Field logs (build 1005, gminfo37): the grant NEVER arrives -- GM AAOS routes every USB attach
+         * to a fixed system handler, so the "Always open" default is never consulted -- and an
+         * unopened adapter re-enumerates ~9 s after attaching, killing the prompt. Every millisecond
+         * waited here is taken from the user's window to tap OK, so this is only a token race guard.
          */
-        private const val IMPLICIT_GRANT_GRACE_MS = 2_000L
+        private const val IMPLICIT_GRANT_GRACE_MS = 200L
         private const val IMPLICIT_GRANT_POLL_MS = 100L
 
         /** While the dialog is up, how often to check for an out-of-band grant or a detach. */

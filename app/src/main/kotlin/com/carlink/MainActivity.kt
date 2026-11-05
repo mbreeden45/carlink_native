@@ -91,10 +91,9 @@ class MainActivity : ComponentActivity() {
     /**
      * Handles a USB_DEVICE_ATTACHED launch/redelivery.
      *
-     * Android delivers ACTION_USB_DEVICE_ATTACHED ONLY to the activity named by the manifest
-     * intent-filter (cold start -> onCreate intent, already running -> onNewIntent). It is never
-     * broadcast to dynamically registered receivers, so the old attach receiver here never fired
-     * and a re-enumerated adapter was only noticed if the user reopened the app by hand.
+     * The manifest intent-filter path (cold start -> onCreate, running -> onNewIntent). NOTE: on GM
+     * AAOS a fixed system USB handler receives every attach, so this path does not fire there; the
+     * ACTION_USB_DEVICE_ATTACHED broadcast (see usbDetachReceiver) does, and drives the connect.
      *
      * Being launched by this intent is also what grants this app permission to the device without
      * any dialog, so reacting here is what makes reconnects silent.
@@ -177,9 +176,7 @@ class MainActivity : ComponentActivity() {
                 intent: Intent,
             ) {
                 // Journal EVERY USB attach/detach on the bus (any device, with uptime) so a log shows
-                // exactly when the adapter re-enumerates -- e.g. whether a vanished permission dialog
-                // coincided with a detach. ATTACHED here is logging only: connecting is driven by the
-                // manifest intent (handleUsbIntent), if this broadcast is delivered at all.
+                // exactly when the adapter re-enumerates.
                 val eventDevice =
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
@@ -193,6 +190,16 @@ class MainActivity : ComponentActivity() {
                         (eventDevice?.let { UsbDeviceWrapper.describeDevice(it, false) } ?: "<no device extra>"),
                     tag = "MAIN",
                 )
+                // On GM AAOS the manifest attach intent never reaches this app (a fixed system USB
+                // handler receives every attach), but this broadcast does. An unopened adapter
+                // re-enumerates every ~9 s, so the permission prompt must go up the moment it appears.
+                if (UsbManager.ACTION_USB_DEVICE_ATTACHED == intent.action) {
+                    eventDevice?.let {
+                        if (KnownDevices.isKnownDevice(it.vendorId, it.productId)) {
+                            carlinkManager?.onUsbDeviceAttached(it.deviceName)
+                        }
+                    }
+                }
                 if (UsbManager.ACTION_USB_DEVICE_DETACHED == intent.action) {
                     val device = eventDevice
 
@@ -486,7 +493,7 @@ class MainActivity : ComponentActivity() {
     private fun registerUsbDetachReceiver() {
         val filter =
             IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED).apply {
-                addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED) // logging only, see usbDetachReceiver
+                addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED) // connects immediately, see usbDetachReceiver
             }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(usbDetachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
