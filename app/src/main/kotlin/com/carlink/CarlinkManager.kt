@@ -41,6 +41,7 @@ import com.carlink.ui.settings.AdapterConfigPreference
 import com.carlink.ui.settings.BehaviorPreferences
 import com.carlink.ui.settings.MicSourceConfig
 import com.carlink.ui.settings.WiFiBandConfig
+import com.carlink.usb.AdapterWifiKick
 import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AppExecutors
 import com.carlink.util.LogCallback
@@ -118,6 +119,11 @@ class CarlinkManager(
         // Short on purpose: an unopened adapter re-enumerates ~9 s after attaching, and the user needs
         // as much of that window as possible to tap OK on the USB prompt.
         private const val ATTACH_SETTLE_MS = 150L
+
+        // Wi-Fi "kick" (AdapterWifiKick): only once the adapter has been absent from USB longer than
+        // its own ~3.5 s restart gap, and at most once a minute.
+        private const val KICK_AFTER_ABSENT_MS = 8_000L
+        private const val KICK_COOLDOWN_MS = 60_000L
 
         // Surface debouncing - wait for size to stabilize before updating codec
         private const val SURFACE_DEBOUNCE_MS = 150L
@@ -235,6 +241,29 @@ class CarlinkManager(
 
     // Single in-flight USB attach debounce (see onUsbDeviceAttached).
     private var attachJob: Job? = null
+
+    // Wi-Fi kick bookkeeping (uptime ms). "Seen" starts at creation so a cold boot kicks 8 s in.
+    @Volatile private var lastAdapterSeenMs = android.os.SystemClock.uptimeMillis()
+
+    @Volatile private var lastKickMs = 0L
+    private var kickJob: Job? = null
+
+    /**
+     * The adapter has not been on USB for a while: ask it over Wi-Fi to switch to its CarPlay USB
+     * mode (what the user's iOS Shortcut did). Non-blocking; the attach broadcast picks it up.
+     */
+    private fun maybeKickAdapterOverWifi() {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastAdapterSeenMs < KICK_AFTER_ABSENT_MS) return
+        if (lastKickMs != 0L && now - lastKickMs < KICK_COOLDOWN_MS) return
+        if (kickJob?.isActive == true) return
+        lastKickMs = now
+        setConnectionDetail("Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode")
+        kickJob =
+            connectionScope.launch {
+                AdapterWifiKick.send(context, BuildConfig.BOX_API_SECRET) { logInfo(it, tag = Logger.Tags.USB) }
+            }
+    }
 
     // Last USB bus snapshot logged when no adapter was found; only re-logged when it changes.
     @Volatile private var lastBusSnapshot: String? = null
@@ -627,6 +656,7 @@ class CarlinkManager(
     // is shared with start/stopMicrophoneCapture, which can block ~1 s joining the capture thread.
     fun onUsbDeviceAttached(deviceName: String?) {
         logInfo("[USB] Attach event for $deviceName", tag = Logger.Tags.USB)
+        lastAdapterSeenMs = android.os.SystemClock.uptimeMillis()
         // Debounce: a fast replug / re-enumeration can deliver several attach intents inside the
         // settle window. Keep only the latest, so two delayed skipIfHealthy=false connects can never
         // fire back-to-back and tear down the session the first one just brought up.
@@ -1154,11 +1184,13 @@ class CarlinkManager(
         var device = UsbDeviceWrapper.findFirst(context, usbManager) { log(it) }
 
         while (device == null && android.os.SystemClock.uptimeMillis() < deadline) {
+            maybeKickAdapterOverWifi()
             kotlinx.coroutines.delay(DEVICE_POLL_MS)
             device = UsbDeviceWrapper.findFirst(context, usbManager) { log(it) }
         }
 
         if (device != null) {
+            lastAdapterSeenMs = android.os.SystemClock.uptimeMillis()
             log("Carlinkit device found!")
         } else {
             // Nothing matching KnownDevices. Log what IS on the bus: this is how a cold boot that

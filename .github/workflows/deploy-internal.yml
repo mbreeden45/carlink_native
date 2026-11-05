@@ -78,7 +78,11 @@ jobs:
           CARLINK_STORE_PASSWORD: ${{ secrets.CARLINK_STORE_PASSWORD }}
           CARLINK_KEY_ALIAS: ${{ secrets.CARLINK_KEY_ALIAS }}
           CARLINK_KEY_PASSWORD: ${{ secrets.CARLINK_KEY_PASSWORD }}
-        run: ./gradlew --no-daemon bundleRelease -Pcarlink.versionCode=${{ steps.version.outputs.code }}
+          # Optional: adapter web-config signing secret (enables the Wi-Fi USB-mode kick).
+          CARLINK_BOX_SECRET: ${{ secrets.CARLINK_BOX_SECRET }}
+        run: |
+          if [ -z "$CARLINK_BOX_SECRET" ]; then echo "::warning::CARLINK_BOX_SECRET not set - Wi-Fi adapter kick disabled in this build"; fi
+          ./gradlew --no-daemon bundleRelease -Pcarlink.versionCode=${{ steps.version.outputs.code }}
 
       - name: Verify bundle is signed
         run: |

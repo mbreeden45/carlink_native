@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Plain HTTP is allowed ONLY to the Carlinkit adapter's own web config on its Wi-Fi (AdapterWifiKick).
+     Everything else keeps the platform default (cleartext blocked). -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.43.1</domain>
+    </domain-config>
+</network-security-config>
