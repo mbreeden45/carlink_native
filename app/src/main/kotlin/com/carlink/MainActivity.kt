@@ -38,6 +38,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.carlink.logging.FileLogManager
 import com.carlink.logging.LogPreset
+import com.carlink.logging.LoggingPreferences
 import com.carlink.logging.Logger
 import com.carlink.logging.apply
 import com.carlink.logging.logInfo
@@ -55,6 +56,8 @@ import com.carlink.usb.UsbDeviceWrapper
 import com.carlink.util.AudioDebugLogger
 import com.carlink.util.IconAssets
 import com.carlink.util.VideoDebugLogger
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Main Activity - Entry Point for Carlink Native
@@ -316,12 +319,23 @@ class MainActivity : ComponentActivity() {
         VideoDebugLogger.setDebugEnabled(isDebugBuild)
         AudioDebugLogger.setDebugEnabled(isDebugBuild)
 
-        // Apply default log preset based on build type
-        // Release: SILENT (errors only) - user can override via settings
-        // Debug: NORMAL (standard logging)
+        // Restore the user's saved log level and "Save logs to file" switch. Previously a release
+        // build forced SILENT on every launch and never re-enabled file logging, so after any restart
+        // (app update, car power cycle) the Settings switch still showed ON while nothing was written.
+        // Read synchronously (bounded) so cold-boot USB events are captured from the first line.
+        val loggingPrefs = LoggingPreferences.getInstance(this)
+        val (savedPreset, saveToFile) =
+            runBlocking {
+                withTimeoutOrNull(500L) { loggingPrefs.getLogLevel() to loggingPrefs.isLoggingEnabled() }
+            } ?: (LogPreset.SILENT to false)
         if (!isDebugBuild) {
-            LogPreset.SILENT.apply()
+            savedPreset.apply()
         }
+        if (saveToFile) {
+            // This activity's own instance: it is the one SettingsScreen toggles and lists.
+            fileLogManager?.enable()
+        }
+        logInfo("[LOGGING] Restored preset=${savedPreset.displayName}, saveToFile=$saveToFile", tag = "MAIN")
 
         logInfo("Carlink Native starting - version $appVersion", tag = "MAIN")
         logInfo("[LOGGING] Debug logging: ${if (isDebugBuild) "ENABLED" else "DISABLED (release build)"}", tag = "MAIN")
