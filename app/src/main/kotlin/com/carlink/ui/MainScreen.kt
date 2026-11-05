@@ -92,6 +92,9 @@ fun MainScreen(
     // letterboxes a non-matching stream instead of stretching it.
     var videoAspect by remember { mutableFloatStateOf(0f) }
 
+    // Why we are not streaming yet, in words a driver can act on (see CarlinkManager.setConnectionDetail).
+    var connectionDetail by remember { mutableStateOf("") }
+
     // Track connection start to avoid restarting on surface recreation
     var hasStartedConnection by remember { mutableStateOf(false) }
 
@@ -142,6 +145,10 @@ fun MainScreen(
 
                     override fun onVideoSizeChanged(width: Int, height: Int) {
                         if (width > 0 && height > 0) videoAspect = width.toFloat() / height
+                    }
+
+                    override fun onConnectionDetail(detail: String) {
+                        connectionDetail = detail
                     }
                 },
             )
@@ -259,6 +266,14 @@ fun MainScreen(
                         style = MaterialTheme.typography.bodyLarge,
                         color = colorScheme.onSurface
                     )
+                    if (connectionDetail.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = connectionDetail,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
 

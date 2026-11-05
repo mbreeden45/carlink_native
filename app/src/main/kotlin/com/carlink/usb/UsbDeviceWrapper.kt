@@ -12,10 +12,12 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import com.carlink.logging.logInfo
 import com.carlink.protocol.KnownDevices
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val ACTION_USB_PERMISSION = "com.carlink.USB_PERMISSION"
@@ -81,19 +83,30 @@ class UsbDeviceWrapper(
         private set
 
     /**
+     * True when the last permission prompt closed WITHOUT a user answer: the system reported
+     * "denied" implausibly fast, or the device left the bus around it. SystemUI's USB dialogs finish
+     * themselves when their device detaches and report that as a denial, so a re-enumerating adapter
+     * makes the dialog "flash" and then look like a refusal. Not a refusal: retry promptly.
+     */
+    @Volatile var dismissedWithoutAnswer: Boolean = false
+        private set
+
+    /**
      * Request USB permission from the user.
      * This will show a system dialog asking the user to grant permission.
      *
+     * At most ONE app-initiated prompt per device instance is ever on screen: if a previous attempt
+     * (since cancelled by the supervisor) already raised one for this deviceName, this call does not
+     * raise a second dialog; it waits for the answer to the existing one. The answer is caught by a
+     * process-lifetime receiver, so it is never lost when an attempt is cancelled mid-wait.
+     *
      * Completes as soon as ANY of these happens, whichever is first:
-     *  - the dialog's broadcast arrives for THIS device (granted or denied),
-     *  - permission becomes visible via [UsbManager.hasPermission] without the dialog being answered
-     *    (the "Always open" attach-launch granted it while the dialog was up, which never sends our
-     *    PendingIntent),
-     *  - the device instance disappears from the bus (returns false, sets [detached], NOT
-     *    [permissionDenied], so the supervisor retries promptly instead of backing off 60 s).
+     *  - the dialog's answer arrives for THIS device (granted / denied / dismissed-by-system),
+     *  - permission becomes visible via [UsbManager.hasPermission] (e.g. the attach launch granted it),
+     *  - the device instance disappears from the bus (sets [detached], NOT [permissionDenied]).
      *
      * @param timeoutMs Timeout in milliseconds to wait for user response
-     * @return true if permission was granted, false if denied, detached, or timeout
+     * @return true if permission was granted, false if denied, dismissed, detached, or timeout
      */
     suspend fun requestPermission(timeoutMs: Long = PERMISSION_TIMEOUT_MS): Boolean {
         if (usbManager.hasPermission(device)) {
@@ -101,88 +114,80 @@ class UsbDeviceWrapper(
             return true
         }
 
-        log("Requesting USB permission for ${device.deviceName}...")
         permissionDenied = false
         detached = false
+        dismissedWithoutAnswer = false
+        val name = device.deviceName
 
-        val outcome = CompletableDeferred<Boolean>()
-        val receiver =
-            object : BroadcastReceiver() {
-                override fun onReceive(
-                    ctx: Context,
-                    intent: Intent,
-                ) {
-                    if (ACTION_USB_PERMISSION != intent.action) return
-                    // The action string is shared by every wrapper instance. Ignore answers for a
-                    // different (e.g. stale, pre-replug) device so they cannot resolve this wait.
-                    val target = intentDevice(intent)
-                    if (target != null && target.deviceName != device.deviceName) return
-                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    log("USB permission ${if (granted) "granted" else "denied"} (dialog)")
-                    outcome.complete(granted)
-                }
-            }
+        PermissionPrompts.ensureReceiver(context)
+        val outcome = PermissionPrompts.waiterFor(name)
+        val requestedAt: Long
+        val existing = PermissionPrompts.pendingSince(name)
+        if (existing != null) {
+            requestedAt = existing
+            log("[USB_PERM] Prompt for $name already on screen (${SystemClock.uptimeMillis() - existing}ms) - not raising another")
+        } else {
+            requestedAt = SystemClock.uptimeMillis()
+            log("[USB_PERM] Raising permission prompt for ${describe()}")
+            PermissionPrompts.markRequested(name, requestedAt)
+            // Create pending intent with explicit Intent (package set) for Android 12+ security
+            // FLAG_MUTABLE is required because UsbManager adds extras to the intent
+            val pendingIntent =
+                PendingIntent.getBroadcast(
+                    context,
+                    0,
+                    Intent(ACTION_USB_PERMISSION).apply { setPackage(context.packageName) },
+                    PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                )
+            usbManager.requestPermission(device, pendingIntent)
+        }
 
-        // Register receiver using ContextCompat for API compatibility
-        // RECEIVER_NOT_EXPORTED ensures only this app can send permission broadcasts
-        ContextCompat.registerReceiver(
-            context,
-            receiver,
-            IntentFilter(ACTION_USB_PERMISSION),
-            ContextCompat.RECEIVER_NOT_EXPORTED,
-        )
-
+        // NOTE: cancellation (supervisor restart) leaves the prompt marked as pending on purpose, so
+        // the next attempt for the same device instance waits on it instead of stacking a new dialog.
         val granted =
-            try {
-                // Create pending intent with explicit Intent (package set) for Android 12+ security
-                // FLAG_MUTABLE is required because UsbManager adds extras to the intent
-                val pendingIntent =
-                    PendingIntent.getBroadcast(
-                        context,
-                        0,
-                        Intent(ACTION_USB_PERMISSION).apply { setPackage(context.packageName) },
-                        PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-                    )
-                usbManager.requestPermission(device, pendingIntent)
-
-                withTimeoutOrNull(timeoutMs) {
-                    while (!outcome.isCompleted) {
-                        if (usbManager.hasPermission(device)) {
-                            log("USB permission appeared while dialog was pending (attach-launch grant)")
-                            outcome.complete(true)
-                            break
-                        }
-                        if (!isStillAttached()) {
-                            log("Device ${device.deviceName} detached while awaiting permission")
-                            detached = true
-                            outcome.complete(false)
-                            break
-                        }
-                        delay(PERMISSION_POLL_MS)
+            withTimeoutOrNull(timeoutMs) {
+                while (!outcome.isCompleted) {
+                    if (usbManager.hasPermission(device)) {
+                        log("[USB_PERM] Permission appeared while prompt was pending (attach-launch grant)")
+                        outcome.complete(true)
+                        break
                     }
-                    outcome.await()
+                    if (!isStillAttached()) {
+                        log("[USB_PERM] $name detached while prompt was pending")
+                        detached = true
+                        outcome.complete(false)
+                        break
+                    }
+                    delay(PERMISSION_POLL_MS)
                 }
-            } finally {
-                try {
-                    context.unregisterReceiver(receiver)
-                } catch (_: IllegalArgumentException) {
-                    // Already unregistered
-                }
+                outcome.await()
             }
+        PermissionPrompts.clear(name)
 
-        if (granted == null) log("USB permission request timed out")
+        if (granted == null) log("[USB_PERM] Permission request timed out after ${timeoutMs}ms")
         val result = granted == true
-        permissionDenied = !result && !detached
+        if (!result && granted != null && !detached) {
+            val elapsed = SystemClock.uptimeMillis() - requestedAt
+            // Give a detach that caused the dismissal a moment to land in the device list.
+            delay(DISMISS_SETTLE_MS)
+            val attached = isStillAttached()
+            if (!attached) detached = true
+            if (!attached || elapsed < AUTO_DISMISS_MS) {
+                dismissedWithoutAnswer = true
+                log(
+                    "[USB_PERM] Prompt closed after ${elapsed}ms with no user answer (attached=$attached) - " +
+                        "treating as a system dismissal, not a refusal",
+                )
+            } else {
+                log("[USB_PERM] User declined USB access after ${elapsed}ms")
+            }
+        }
+        permissionDenied = !result && !detached && !dismissedWithoutAnswer
         return result
     }
 
-    private fun intentDevice(intent: Intent): UsbDevice? =
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
-        }
+    /** One-line identity of this device for logs (serial only once permission is held). */
+    fun describe(): String = describeDevice(device, usbManager.hasPermissionSafe(device))
 
     /**
      * Open the USB device and claim the interface.
@@ -217,6 +222,10 @@ class UsbDeviceWrapper(
 
         _isOpened.set(true)
         log("Device opened: VID=0x${vendorId.toString(16)} PID=0x${productId.toString(16)}")
+        // With permission held the serial is readable. The system keys a persisted "Always open"
+        // default on VID/PID AND these strings, so if they differ between boots the default never
+        // matches again and the prompt returns -- this line is how to check that across two boots.
+        log("[USB_ID] ${describe()}")
         return true
     }
 
@@ -665,6 +674,45 @@ class UsbDeviceWrapper(
         private const val PERMISSION_POLL_MS = 250L
 
         /**
+         * A "denied" faster than this cannot be a human tap: the dialog was closed by the system
+         * (typically because the adapter re-enumerated). Treated as a dismissal, retried promptly.
+         */
+        private const val AUTO_DISMISS_MS = 1_500L
+        private const val DISMISS_SETTLE_MS = 300L
+
+        private fun hex4(v: Int) = "%04x".format(v)
+
+        /** Everything the system keys a persisted "Always open" default on, for the log. */
+        fun describeDevice(
+            d: UsbDevice,
+            canReadSerial: Boolean,
+        ): String {
+            val classes = (0 until d.interfaceCount).joinToString(",") { "0x%02x".format(d.getInterface(it).interfaceClass) }
+            val serial =
+                if (canReadSerial) {
+                    runCatching { d.serialNumber }.getOrNull() ?: "none"
+                } else {
+                    "n/a(no permission yet)"
+                }
+            val mfr = runCatching { d.manufacturerName }.getOrNull()
+            val product = runCatching { d.productName }.getOrNull()
+            val version = runCatching { d.version }.getOrNull()
+            return "${d.deviceName} ${hex4(d.vendorId)}:${hex4(d.productId)} devClass=0x%02x ifaces=[$classes] ".format(d.deviceClass) +
+                "mfr='$mfr' product='$product' ver=$version serial=$serial"
+        }
+
+        /** Snapshot of EVERY device on the host bus (not just Carlinkit), for cold-boot diagnosis. */
+        fun describeBus(usbManager: UsbManager): String {
+            val all = usbManager.deviceList.values
+            if (all.isEmpty()) return "USB bus: no devices enumerated"
+            return "USB bus (${all.size}): " +
+                all.joinToString(" | ") { d ->
+                    val known = if (KnownDevices.isKnownDevice(d.vendorId, d.productId)) " [KNOWN]" else ""
+                    describeDevice(d, usbManager.hasPermissionSafe(d)) + known
+                }
+        }
+
+        /**
          * Find all connected Carlinkit devices.
          */
         fun findDevices(usbManager: UsbManager): List<UsbDevice> =
@@ -684,4 +732,92 @@ class UsbDeviceWrapper(
             return UsbDeviceWrapper(context, usbManager, device, logCallback)
         }
     }
+}
+
+private fun UsbManager.hasPermissionSafe(d: UsbDevice): Boolean = runCatching { hasPermission(d) }.getOrDefault(false)
+
+/**
+ * Process-wide bookkeeping for app-initiated USB permission prompts.
+ *
+ * The receiver lives for the whole process (registered once on the application context), so a
+ * dialog answer is captured even if the connection attempt that raised it was cancelled meanwhile.
+ * [pendingSince] lets a later attempt for the same device instance wait on the dialog already on
+ * screen instead of raising a second one.
+ */
+private object PermissionPrompts {
+    private val since = ConcurrentHashMap<String, Long>()
+    private val waiters = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+
+    @Volatile private var registered = false
+
+    private val receiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(
+                ctx: Context,
+                intent: Intent,
+            ) {
+                if (ACTION_USB_PERMISSION != intent.action) return
+                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                val dev =
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                    }
+                val name = dev?.deviceName
+                logInfo("[USB_PERM] Prompt answer for ${name ?: "<unknown device>"}: granted=$granted", tag = "USB")
+                if (name == null) {
+                    since.clear()
+                    waiters.values.forEach { it.complete(granted) }
+                    waiters.clear()
+                    return
+                }
+                since.remove(name)
+                waiters.remove(name)?.complete(granted)
+            }
+        }
+
+    fun ensureReceiver(context: Context) {
+        if (registered) return
+        synchronized(this) {
+            if (registered) return
+            // RECEIVER_NOT_EXPORTED: only this app's PendingIntent can deliver here.
+            ContextCompat.registerReceiver(
+                context.applicationContext,
+                receiver,
+                IntentFilter(ACTION_USB_PERMISSION),
+                ContextCompat.RECEIVER_NOT_EXPORTED,
+            )
+            registered = true
+        }
+    }
+
+    /** Uptime when a still-live prompt was raised for [name], or null. Expires with the wait timeout. */
+    fun pendingSince(name: String): Long? {
+        val t = since[name] ?: return null
+        if (SystemClock.uptimeMillis() - t > PROMPT_EXPIRY_MS) {
+            since.remove(name)
+            return null
+        }
+        return t
+    }
+
+    fun markRequested(
+        name: String,
+        atMs: Long,
+    ) {
+        since[name] = atMs
+    }
+
+    fun waiterFor(name: String): CompletableDeferred<Boolean> =
+        waiters.compute(name) { _, old -> if (old == null || old.isCompleted) CompletableDeferred() else old }!!
+
+    fun clear(name: String) {
+        since.remove(name)
+        waiters.remove(name)
+    }
+
+    /** Matches UsbDeviceWrapper's dialog wait (5 min); after that a prompt is assumed gone. */
+    private const val PROMPT_EXPIRY_MS = 5 * 60_000L
 }
