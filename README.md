@@ -6,9 +6,12 @@ head units, talking to a **Carlinkit CPC200-CCPA** USB adapter. No Flutter/Dart.
 Built and tuned for a **2025 Chevrolet Equinox EV** (GM AAOS) with an iPhone. The goal is
 "set-and-forget": get in the car, CarPlay comes up, no prompts, no rituals.
 
-> **Status:** unit-tested and builds cleanly, but the recent reliability/mic changes have **not yet
-> been run on a vehicle**. See [`documents/troubleshooting.md`](documents/troubleshooting.md) for what
-> changed, why, and what to watch on the first drive.
+> **Using it in the car?** Start with the plain-language
+> [**user guide for GM EVs**](documents/USER_GUIDE_GM_EV.md): one-time setup, the one-tap start,
+> what the on-screen messages mean, and how this differs from the usual iPhone-Shortcut method.
+>
+> **Status:** in-car tested on a 2025 Equinox EV (build 1007): cold start, one USB "OK" tap, CarPlay
+> up in about 10 s. See [`documents/troubleshooting.md`](documents/troubleshooting.md) for history.
 
 ## What this fork changes
 
@@ -17,7 +20,8 @@ Compared with the upstream it was forked from:
 | Problem | Cause found in the code | Fix |
 |---|---|---|
 | Stuck on **Connecting…**, needed cable pull + force stop | Connect ran in a UI coroutine that Compose cancelled mid-connect; racing start/stop callers; init sequence sleeping on the main thread; reconnect gave up after 5 tries | `ConnectionSupervisor`: own scope, single-flight, IO thread, retries forever (2 s→30 s), watchdog for a silent/stalled adapter |
-| USB **"Allow" pop-up** every trip | Attach event handled by a receiver Android never delivers it to; 30 s permission timeout discarded late answers and re-prompted | Attach handled in `onCreate`/`onNewIntent`, `singleTask`, 5 min permission wait, 60 s back-off after refusal |
+| USB **"Allow" pop-up** every trip, flashing away | GM routes every USB attach to its own fixed handler, so "Always open" is never used; an unopened adapter restarts every ~9 s, killing the prompt | Can't be removed for a Play Store app: one OK tap per power-up. The prompt now goes up within ~0.3 s of the adapter appearing (attach broadcast), and a system-closed prompt retries at once |
+| Adapter **not on USB** at power-up (needed an iPhone Shortcut) | The adapter sometimes doesn't present its CarPlay USB interface until it gets a web-config request | App sends that request itself over the adapter's Wi-Fi (`AdapterWifiKick`, needs `CARLINK_BOX_SECRET`) |
 | **Mic silent** in Snapchat / voice messages / calls | Adapter's `START_RECORD_AUDIO`/`STOP_RECORD_AUDIO` commands were ignored (only Siri/call started the mic); no `microphone` foreground-service type so Android silences capture when app isn't visible | Commands handled; capture-thread-driven send; source fallback + silence probe; `microphone` FGS type with safe fallback |
 | Audio plays via car **Bluetooth**, Spotify silent | No audio focus held; mic/audio-transfer settings were only sent on the very first run | `AudioFocusController` (toggle in Settings); both settings re-asserted every session. *Also requires forgetting the car's Bluetooth on the iPhone, see docs.* |
 | Foreground service never actually started on Android 14+ | `connectedDevice` type missing its prerequisite permission → `SecurityException` swallowed | Permission added, graceful fallback chain |
@@ -80,7 +84,8 @@ through Google Play **Internal Testing**:
 2. Upload the AAB to an Internal Testing track and add your Google account as a tester.
 3. Install/update from the Play Store on the head unit. **Update over the top; don't uninstall**, or
    the USB "Always" default is lost.
-4. First plug-in: tick **Always** on the USB prompt and allow the microphone.
+4. First plug-in: tap **OK** on the USB prompt and allow the microphone. ("Always open" has no effect
+   on GM cars; see the [user guide](documents/USER_GUIDE_GM_EV.md).)
 
 ## iPhone setup that matters
 
