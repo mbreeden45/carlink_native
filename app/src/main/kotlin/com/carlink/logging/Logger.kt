@@ -338,6 +338,10 @@ object Logger {
         message: String,
         throwable: Throwable? = null,
     ) {
+        // On-screen USB diagnostics: captured BEFORE level/tag filtering so it works at any log level
+        // (release builds default to Silent, and the USB wrapper logs at DEBUG).
+        DiagnosticJournal.offer(message)
+
         // Check level
         if (level.priority < minLevel.priority) {
             return
