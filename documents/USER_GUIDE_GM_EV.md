@@ -17,10 +17,11 @@ No iPhone Shortcut.
    own instructions describe.
 3. **On the iPhone, forget the car's own Bluetooth** (Settings → Bluetooth → ⓘ next to the car →
    Forget This Device). Otherwise iOS can send audio to the car's Bluetooth instead of CarPlay.
-4. **Join the car to the adapter's Wi-Fi.** In the car's Wi-Fi settings, connect to the adapter's
-   network ("carlink"), with the same password your phone uses. The car will show "no internet";
-   that's expected. The car keeps using cellular for everything else. If asked "stay connected?",
-   choose **Yes**.
+4. **Let the app use the adapter's Wi-Fi.** On first start, Carlink asks Android to join the
+   adapter's network ("carlink"). Approve the **"connect to carlink?"** prompt once; after that it
+   rejoins by itself. The car shows "no internet" on that network; that's expected, and the car keeps
+   using cellular for everything else. (GM cars don't rejoin this network on their own at power-up,
+   which is why the app does it.)
    - Why: some days the adapter powers up without showing up on USB. When that happens, Carlink
      sends it a "switch to CarPlay mode" request over this Wi-Fi, the same request the old iPhone
      Shortcut sent.
@@ -29,9 +30,13 @@ No iPhone Shortcut.
 
 ### Only if you build the app yourself
 
-Add a GitHub repository secret named `CARLINK_BOX_SECRET` holding the adapter's web-config signing
-secret (the long text your iPhone Shortcut uses as `SECRET`). Without it, the automatic Wi-Fi request
-is switched off and the build log shows a warning. The secret is never written into the source code.
+Add two GitHub repository secrets (never written into the source code; each missing one only
+switches its feature off and shows a build warning):
+
+| Secret | Value | Enables |
+|---|---|---|
+| `CARLINK_BOX_SECRET` | The adapter's web-config signing secret (the long text your iPhone Shortcut uses as `SECRET`) | Sending the wake request |
+| `CARLINK_BOX_WIFI_PSK` | The adapter's Wi-Fi password | The app joining the adapter's Wi-Fi itself |
 
 ---
 
@@ -48,6 +53,7 @@ The grey line under **[ Connecting... ]** tells you what's happening:
 |---|---|
 | Looking for the adapter on USB | Normal for the first second or two. |
 | Adapter not detected on USB - retrying | The adapter hasn't shown up on USB yet. |
+| Adapter not on USB - joining the adapter's Wi-Fi ("carlink") to wake it | The app is joining the adapter's Wi-Fi. The first time, approve the "connect to carlink?" prompt. |
 | Adapter not on USB - connect the car to the adapter's Wi-Fi ("carlink") to wake it | The adapter needs waking but the car isn't on its Wi-Fi. Join "carlink" in the car's Wi-Fi settings; the request goes out the moment it connects. |
 | Adapter not on USB - asking it over Wi-Fi to switch to CarPlay mode | The automatic replacement for the Shortcut is running. |
 | Adapter accepted the Wi-Fi request - waiting for it on USB | It worked; the adapter should appear within a few seconds. |
@@ -69,6 +75,8 @@ saved to the car itself, so the photo is the way to get them off.
 | `[BOX_KICK] … not on any Wi-Fi network` | The car isn't joined to the adapter's Wi-Fi (setup step 4). |
 | `[BOX_KICK] … rejected` | The adapter refused the request: the signing secret is wrong. |
 | `[BOX_KICK] Not configured` | The build has no `CARLINK_BOX_SECRET`. |
+| `[BOX_WIFI] Joined "carlink"` | The app joined the adapter's Wi-Fi by itself. |
+| `[BOX_WIFI] … not found or not approved` | The adapter's Wi-Fi wasn't up yet, or the join prompt was dismissed; retried every 30 s. |
 | `[USB_EVENT] ATTACHED / DETACHED` every ~9 s | Normal until the app opens the adapter (see below). |
 
 ---

@@ -71,13 +71,14 @@ object AdapterWifiKick {
     fun send(
         context: Context,
         secret: String,
+        preferred: Network? = null,
         log: (String) -> Unit,
     ): Outcome {
         if (secret.isBlank()) {
             log("[BOX_KICK] Not configured (no CARLINK_BOX_SECRET in this build) - skipping")
             return Outcome.NO_SECRET
         }
-        val wifi = findWifiNetwork(context)
+        val wifi = preferred ?: findWifiNetwork(context)
         if (wifi == null) {
             log("[BOX_KICK] Head unit is not on any Wi-Fi network - join the adapter's Wi-Fi in car settings")
             return Outcome.NO_WIFI

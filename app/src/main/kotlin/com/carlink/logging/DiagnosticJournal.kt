@@ -29,6 +29,7 @@ object DiagnosticJournal {
             "[USB_ID]",
             "[USB_BUS]",
             "[BOX_KICK]",
+            "[BOX_WIFI]",
             "[USB_ATTACH]",
             "[USB_DETACH]",
             "[STATUS]",
