@@ -151,6 +151,8 @@ import com.carlink.ui.settings.DisplayModePreference
 import com.carlink.ui.settings.MicSourceConfig
 import com.carlink.ui.settings.SampleRateConfig
 import com.carlink.ui.settings.SettingsTab
+import com.carlink.ui.settings.UsbDiagnosticsCard
+import com.carlink.ui.settings.UsbDiagnosticsDialog
 import com.carlink.ui.settings.WiFiBandConfig
 import com.carlink.ui.theme.AutomotiveDimens
 import kotlinx.coroutines.launch
@@ -1503,6 +1505,7 @@ private fun LogsTabContent(
     var showDeleteDialog by remember { mutableStateOf<File?>(null) }
     var showLogLevelDialog by remember { mutableStateOf(false) }
     var showDebugWarningDialog by remember { mutableStateOf(false) }
+    var showUsbDiagnostics by remember { mutableStateOf(false) }
     val colorScheme = MaterialTheme.colorScheme
     // File export state - stores the file to export when SAF picker returns
     // Using both pendingExportFile and isExporting prevents race conditions on rapid clicks
@@ -1588,6 +1591,8 @@ private fun LogsTabContent(
                     .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
+            // On-screen journal: exported files can only be saved to the head unit itself.
+            UsbDiagnosticsCard(onOpen = { showUsbDiagnostics = true })
             // File Logging Card - Matches Flutter _buildFileLoggingCard
             LoggingControlCard(
                 title = "File Logging",
@@ -1769,6 +1774,9 @@ private fun LogsTabContent(
         }
     }
     // Log Level Selector Dialog - Matches Flutter _LogLevelSelectorDialog
+    if (showUsbDiagnostics) {
+        UsbDiagnosticsDialog(onDismiss = { showUsbDiagnostics = false })
+    }
     if (showLogLevelDialog) {
         LogLevelSelectorDialog(
             currentLevel = currentLogLevel,
